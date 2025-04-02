@@ -41,17 +41,18 @@ export default class GuitarNoteDetector {
     this.trackingConfig = {
       maxGapFrames: 2,
       minNoteDuration: 0.08,
+      maxGapTime: 0.1, // Added for pitch continuity (in seconds)
       ...trackingConfig
     };
 
     // Tab generation parameters
     this.tabConfig = {
-      stringMidi: [40, 45, 50, 55, 59, 64],
+      stringMidi: [40, 45, 50, 55, 59, 64], // E2, A2, D3, G3, B3, E4
       maxFret: 24,
       ...tabConfig
     };
 
-    // Set direct access properties for frequently used values
+    // Set direct access properties
     this.stringMidi = this.tabConfig.stringMidi;
     this.maxFret = this.tabConfig.maxFret;
 
@@ -79,169 +80,182 @@ export default class GuitarNoteDetector {
     this.notes = [];
     const activeNotes = new Map();
     const timePerFrame = this.hopSize / this.sampleRate;
+    this.previousEnergy = 0; // For onset detection
 
     this.cqtFrames.forEach((magnitude, idx) => {
-      // Adaptive thresholding
+      // Spectral flatness for adaptive thresholding
+      const spectralFlatness = this.calculateSpectralFlatness(magnitude);
+      const flatnessFactor = spectralFlatness < 0.1 ? 1.5 : 1.0; // Boost for tonal content
       const sortedMagnitudes = [...magnitude].sort((a, b) => a - b);
       const referenceIndex = Math.floor(sortedMagnitudes.length * this.thresholdConfig.adaptiveReferencePercentile);
-      const referenceMagnitude = referenceIndex < sortedMagnitudes.length ?
-        sortedMagnitudes[referenceIndex] : 0;
-
-      const adaptiveComponent = this.thresholdConfig.adaptiveThresholdFactor * referenceMagnitude;
+      const referenceMagnitude = referenceIndex < sortedMagnitudes.length ? sortedMagnitudes[referenceIndex] : 0;
+      const adaptiveComponent = this.thresholdConfig.adaptiveThresholdFactor * referenceMagnitude * flatnessFactor;
       const threshold = Math.max(this.thresholdConfig.absoluteThreshold, adaptiveComponent);
 
-      // Refined peak picking with interpolation
+      // Onset detection
+      const energy = magnitude.reduce((sum, val) => sum + val * val, 0);
+      const isOnset = idx > 0 && energy > 2 * this.previousEnergy;
+      this.previousEnergy = energy;
+
+      // Peak picking with interpolation
       const potentialPeaks = [];
       for (let k = 1; k < this.cqtTotalBins - 1; k++) {
         if (magnitude[k] > magnitude[k - 1] && magnitude[k] > magnitude[k + 1] && magnitude[k] > threshold) {
-          // Quadratic peak interpolation
           const y_minus = magnitude[k - 1];
           const y_0 = magnitude[k];
           const y_plus = magnitude[k + 1];
-
-          // Calculate interpolation offset
           const denominator = y_minus - 2 * y_0 + y_plus;
-          const p = Math.abs(denominator) > 1e-6 ?
-            0.5 * (y_minus - y_plus) / denominator : 0;
-
-          // Calculate interpolated bin and magnitude
+          const p = Math.abs(denominator) > 1e-6 ? 0.5 * (y_minus - y_plus) / denominator : 0;
           const interpolatedBin = k + p;
           const interpolatedMagnitude = y_0 - 0.25 * (y_minus - y_plus) * p;
-
           potentialPeaks.push({ bin: interpolatedBin, magnitude: interpolatedMagnitude });
         }
       }
 
-      // Apply harmonic filtering
+      // Harmonic filtering
       const sortedPeaks = [...potentialPeaks].sort((a, b) => a.bin - b.bin);
       const confirmedPeaks = [];
-
       for (const peak of sortedPeaks) {
         let isHarmonic = false;
-
-        // Check if this peak is a harmonic of any already confirmed peak
         for (const fundamental of confirmedPeaks) {
-          if (fundamental.bin <= 0) continue;
-
           const freqRatio = peak.bin / fundamental.bin;
-          const nearestInteger = Math.round(freqRatio);
-
-          if (nearestInteger >= 2 &&
-              Math.abs(freqRatio - nearestInteger) / nearestInteger < this.harmonicConfig.harmonicTolerance &&
-              fundamental.magnitude > this.harmonicConfig.harmonicSuppressionFactor * peak.magnitude) {
-            isHarmonic = true;
-            break;
+          for (let harmonic = 2; harmonic <= 5; harmonic++) {
+            if (Math.abs(freqRatio - harmonic) < this.harmonicConfig.harmonicTolerance * harmonic &&
+                fundamental.magnitude > this.harmonicConfig.harmonicSuppressionFactor * peak.magnitude) {
+              isHarmonic = true;
+              break;
+            }
           }
+          if (isHarmonic) break;
         }
-
-        if (!isHarmonic) {
-          confirmedPeaks.push(peak);
-        }
+        if (!isHarmonic) confirmedPeaks.push(peak);
       }
 
-      // Improved note tracking with gap closing
-      // Increment counter for all active notes
-      activeNotes.forEach((entry) => {
-        entry.framesSinceLastSeen += 1;
-      });
-
-      // Process confirmed peaks
+      // Note tracking with pitch continuity
+      activeNotes.forEach((entry) => entry.framesSinceLastSeen += 1);
       const currentMidis = new Set();
-
       confirmedPeaks.forEach(peak => {
         const midi = Math.round(this.minMidi + peak.bin);
         currentMidis.add(midi);
 
         if (activeNotes.has(midi)) {
-          // Reset the counter for existing notes
-          activeNotes.get(midi).framesSinceLastSeen = 0;
-          // Optionally update magnitude if current is higher
-          if (peak.magnitude > activeNotes.get(midi).note.magnitude) {
-            activeNotes.get(midi).note.magnitude = peak.magnitude;
-          }
+          const entry = activeNotes.get(midi);
+          entry.framesSinceLastSeen = 0;
+          if (peak.magnitude > entry.note.magnitude) entry.note.magnitude = peak.magnitude;
         } else {
-          // Create a new note
-          const newNote = {
-            midi,
-            frequency: 440 * Math.pow(2, (midi - 69) / 12),
-            note: this.midiToNote(midi),
-            time: idx * timePerFrame,
-            startFrame: idx,
-            magnitude: peak.magnitude
-          };
-
-          // Add to active notes with counter
-          activeNotes.set(midi, {
-            note: newNote,
-            framesSinceLastSeen: 0
-          });
+          // Check for pitch continuity
+          const recentNotes = this.notes.filter(n => Math.abs(n.midi - midi) <= 1 &&
+            (idx - n.startFrame) * timePerFrame < this.trackingConfig.maxGapTime);
+          if (recentNotes.length > 0 &&
+              idx - recentNotes[0].startFrame - recentNotes[0].duration / timePerFrame < this.trackingConfig.maxGapFrames) {
+            const lastNote = recentNotes[0];
+            lastNote.duration = (idx - lastNote.startFrame) * timePerFrame;
+            activeNotes.set(midi, { note: lastNote, framesSinceLastSeen: 0 });
+          } else {
+            const newNote = {
+              midi,
+              frequency: 440 * Math.pow(2, (midi - 69) / 12),
+              note: this.midiToNote(midi),
+              time: isOnset ? idx * timePerFrame : (idx - 1) * timePerFrame,
+              startFrame: idx,
+              magnitude: peak.magnitude
+            };
+            activeNotes.set(midi, { note: newNote, framesSinceLastSeen: 0 });
+          }
         }
       });
 
-      // Terminate notes that exceeded the gap tolerance
+      // Terminate inactive notes
       activeNotes.forEach((entry, midi) => {
         if (entry.framesSinceLastSeen > this.trackingConfig.maxGapFrames) {
-          // Calculate duration excluding the gap
           const duration = (idx - entry.note.startFrame - entry.framesSinceLastSeen) * timePerFrame;
-
           if (duration >= this.trackingConfig.minNoteDuration) {
             entry.note.duration = duration;
             this.notes.push(entry.note);
           }
-
           activeNotes.delete(midi);
         }
       });
     });
 
-    // Handle remaining active notes at the end of processing
+    // Handle remaining active notes
     activeNotes.forEach((entry, midi) => {
-      // Calculate duration excluding any trailing gap
       const duration = (this.cqtFrames.length - entry.note.startFrame - entry.framesSinceLastSeen) * timePerFrame;
-
       if (duration >= this.trackingConfig.minNoteDuration) {
         entry.note.duration = duration;
         this.notes.push(entry.note);
       }
     });
 
+    // Post-process: Merge close notes
+    this.notes = this.mergeCloseNotes(this.notes, timePerFrame);
+
+    // Generate optimized guitar tab
     this.generateGuitarTab();
     return { notes: this.notes, guitarTab: this.guitarTab };
   }
 
+  // Helper: Calculate spectral flatness
+  calculateSpectralFlatness(magnitude) {
+    const geometricMean = Math.exp(magnitude.reduce((sum, val) => sum + Math.log(val + 1e-10), 0) / magnitude.length);
+    const arithmeticMean = magnitude.reduce((sum, val) => sum + val, 0) / magnitude.length;
+    return geometricMean / arithmeticMean;
+  }
+
+  // Helper: Merge close notes
+  mergeCloseNotes(notes, timePerFrame) {
+    const merged = [];
+    notes.sort((a, b) => a.time - b.time);
+    let current = null;
+    for (const note of notes) {
+      if (!current) {
+        current = { ...note };
+      } else if (note.midi === current.midi &&
+                 note.time < current.time + current.duration + this.trackingConfig.maxGapTime) {
+        current.duration = Math.max(current.duration, (note.startFrame - current.startFrame) * timePerFrame + note.duration);
+        current.magnitude = Math.max(current.magnitude, note.magnitude);
+      } else {
+        merged.push(current);
+        current = { ...note };
+      }
+    }
+    if (current) merged.push(current);
+    return merged;
+  }
+
+  // Optimized guitar tab generation
   generateGuitarTab() {
     const timeBins = Math.ceil(this.duration / (this.hopSize / this.sampleRate));
     this.guitarTab = Array.from({ length: this.stringMidi.length }, () => new Array(timeBins).fill('-'));
-
-    // Track last played fret on each string for better heuristics
     const lastPlayedFret = new Array(this.stringMidi.length).fill(null);
 
     this.notes.forEach(note => {
       const positions = this.noteToTab(note.note);
-
       if (positions.length) {
         const startBin = Math.floor(note.time / (this.hopSize / this.sampleRate));
         const endBin = Math.ceil((note.time + note.duration) / (this.hopSize / this.sampleRate));
 
-        // Try to find a free string at the start time
+        // Find the best position (lowest fret, favoring open strings or continuity)
+        let bestPos = null;
+        let minFretDiff = Infinity;
         for (const pos of positions) {
-          if (this.guitarTab[pos.string - 1][startBin] === '-') {
-            // Found a free string, assign the fret
-            this.guitarTab[pos.string - 1][startBin] = pos.fret.toString();
-
-            // Fill sustain markers
-            for (let bin = startBin + 1; bin < endBin && bin < timeBins; bin++) {
-              if (this.guitarTab[pos.string - 1][bin] === '-') {
-                this.guitarTab[pos.string - 1][bin] = '-'; // Standard sustain marker
-              }
-            }
-
-            // Update last played fret on this string
-            lastPlayedFret[pos.string - 1] = pos.fret;
-
-            // Found a place for this note, stop looking
-            break;
+          const fretDiff = lastPlayedFret[pos.string - 1] !== null
+            ? Math.abs(pos.fret - lastPlayedFret[pos.string - 1])
+            : pos.fret;
+          if (this.guitarTab[pos.string - 1][startBin] === '-' && fretDiff < minFretDiff) {
+            bestPos = pos;
+            minFretDiff = fretDiff;
           }
+        }
+
+        if (bestPos) {
+          this.guitarTab[bestPos.string - 1][startBin] = bestPos.fret.toString();
+          for (let bin = startBin + 1; bin < endBin && bin < timeBins; bin++) {
+            if (this.guitarTab[bestPos.string - 1][bin] === '-') {
+              this.guitarTab[bestPos.string - 1][bin] = '-';
+            }
+          }
+          lastPlayedFret[bestPos.string - 1] = bestPos.fret;
         }
       }
     });
