@@ -1,0 +1,526 @@
+/* === Base Styles & Variables === */
+:root {
+  /* Light Theme (Default) */
+  --bg-color: #f8f9fa;          /* Lighter background */
+  --text-color: #212529;        /* Darker text for contrast */
+  --container-bg: #ffffff;      /* White container background */
+  --border-color: #dee2e6;      /* Subtle border color */
+  --accent-color: #007bff;      /* Primary blue accent */
+  --accent-text-color: #ffffff; /* Text on accent background */
+  --secondary-accent-color: #6c757d; /* Grey for secondary elements */
+  --highlight-bg: rgba(0, 123, 255, 0.1); /* Light blue highlight */
+  --playhead-color: #dc3545;     /* Red playhead */
+  --playhead-shadow: rgba(220, 53, 69, 0.5);
+  --note-active-bg: rgba(255, 193, 7, 0.4); /* Yellow highlight */
+  --note-active-shadow: rgba(255, 193, 7, 0.6);
+  --note-pulse-color: rgba(40, 167, 69, 0.5); /* Green pulse */
+  --slider-track-bg: #dee2e6;
+  --slider-thumb-bg: var(--accent-color);
+  --button-bg: var(--accent-color);
+  --button-hover-bg: #0056b3;
+  --button-active-bg: var(--secondary-accent-color);
+  --button-active-hover-bg: #5a6268;
+  --tab-label-bg: #f1f3f4;
+  --tab-sustained-color: #6c757d;
+  --tab-note-color: #000000;
+  --tab-hover-bg: rgba(0, 0, 0, 0.03);
+
+  /* Dark Theme Variables (activated by adding class="dark-mode" to body) */
+}
+
+.dark-mode {
+  --bg-color: #121212;
+  --text-color: #e0e0e0;
+  --container-bg: #1e1e1e;
+  --border-color: #444;
+  --accent-color: #0d6efd; /* Slightly brighter blue for dark mode */
+  --accent-text-color: #ffffff;
+  --secondary-accent-color: #6c757d;
+  --highlight-bg: rgba(13, 110, 253, 0.2);
+  --playhead-color: #ff4d4d; /* Brighter red */
+  --playhead-shadow: rgba(255, 77, 77, 0.6);
+  --note-active-bg: rgba(255, 210, 0, 0.4); /* Brighter yellow */
+  --note-active-shadow: rgba(255, 210, 0, 0.6);
+  --note-pulse-color: rgba(50, 205, 50, 0.5); /* Brighter green */
+  --slider-track-bg: #555;
+  --slider-thumb-bg: var(--accent-color);
+  --button-bg: var(--accent-color);
+  --button-hover-bg: #0b5ed7;
+  --button-active-bg: var(--secondary-accent-color);
+  --button-active-hover-bg: #5a6268;
+  --tab-label-bg: #2a2a2a;
+  --tab-sustained-color: #999;
+  --tab-note-color: #f0f0f0;
+  --tab-hover-bg: rgba(255, 255, 255, 0.05);
+}
+
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+body {
+  font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; /* Modern system fonts */
+  background-color: var(--bg-color);
+  color: var(--text-color);
+  margin: 0;
+  padding: 20px;
+  line-height: 1.6;
+  transition: background-color 0.3s ease, color 0.3s ease;
+}
+
+.container {
+  max-width: 1000px;
+  margin: 20px auto;
+  padding: 25px;
+  background-color: var(--container-bg);
+  border-radius: 8px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+  border: 1px solid var(--border-color);
+  transition: background-color 0.3s ease, border-color 0.3s ease;
+}
+
+h1 {
+  color: var(--text-color);
+  margin-top: 0;
+  margin-bottom: 25px;
+  font-weight: 600;
+  text-align: center;
+  letter-spacing: -0.5px;
+}
+
+/* === File Input & Audio Player === */
+input[type="file"] {
+  display: block;
+  margin: 15px auto;
+  padding: 10px 15px;
+  border: 1px dashed var(--border-color);
+  background-color: var(--bg-color);
+  color: var(--text-color);
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background-color 0.2s ease, border-color 0.2s ease;
+}
+input[type="file"]::file-selector-button { /* Style the button inside */
+    padding: 8px 15px;
+    margin-right: 10px;
+    background-color: var(--secondary-accent-color);
+    color: var(--accent-text-color);
+    border: none;
+    border-radius: 3px;
+    cursor: pointer;
+    transition: background-color 0.2s ease;
+}
+input[type="file"]::file-selector-button:hover {
+  background-color: #5a6268;
+}
+input[type="file"]:hover {
+  border-color: var(--accent-color);
+  background-color: var(--container-bg);
+}
+
+audio {
+  display: block;
+  width: 100%;
+  margin: 20px 0;
+  border-radius: 4px;
+  outline: none;
+  filter: invert(var(--dark-mode, 0)); /* Basic dark mode for controls if needed */
+}
+
+/* === Controls Section === */
+#controls {
+  margin: 25px 0;
+  padding: 20px;
+  background-color: var(--bg-color);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  text-align: left;
+  transition: background-color 0.3s ease, border-color 0.3s ease;
+}
+
+.control-row {
+  margin-bottom: 15px;
+  display: flex;
+  align-items: center;
+  gap: 15px; /* Spacing between label and control */
+}
+.control-row:last-child {
+  margin-bottom: 0;
+}
+
+.control-row label {
+  flex-basis: 120px; /* Fixed width for labels */
+  flex-shrink: 0;
+  font-size: 0.9em;
+  color: var(--secondary-accent-color);
+  text-align: right;
+  padding-right: 5px;
+}
+.control-row label span {
+  font-weight: bold;
+  color: var(--text-color);
+  min-width: 40px; /* Ensure space for values */
+  display: inline-block;
+  text-align: left;
+}
+
+/* Slider Styling */
+input[type="range"] {
+  flex-grow: 1;
+  height: 6px;
+  cursor: pointer;
+  appearance: none;
+  background: var(--slider-track-bg);
+  border-radius: 3px;
+  outline: none;
+  transition: background-color 0.3s ease;
+}
+
+input[type="range"]::-webkit-slider-thumb {
+  appearance: none;
+  width: 18px;
+  height: 18px;
+  background: var(--slider-thumb-bg);
+  border-radius: 50%;
+  cursor: pointer;
+  transition: background-color 0.2s ease;
+}
+
+input[type="range"]::-moz-range-thumb {
+  width: 18px;
+  height: 18px;
+  background: var(--slider-thumb-bg);
+  border-radius: 50%;
+  border: none;
+  cursor: pointer;
+  transition: background-color 0.2s ease;
+}
+
+input[type="range"]:hover::-webkit-slider-thumb { background: var(--button-hover-bg); }
+input[type="range"]:hover::-moz-range-thumb { background: var(--button-hover-bg); }
+
+/* Button Styling */
+.control-button {
+  padding: 10px 20px;
+  background-color: var(--button-bg);
+  color: var(--accent-text-color);
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.95em;
+  font-weight: 500;
+  transition: background-color 0.2s ease, transform 0.1s ease;
+  min-width: 110px;
+  text-align: center;
+}
+
+.control-button:hover {
+  background-color: var(--button-hover-bg);
+  transform: translateY(-1px);
+}
+
+.control-button:active {
+  transform: translateY(0);
+}
+
+.control-button:disabled {
+  background-color: #cccccc;
+  cursor: not-allowed;
+  opacity: 0.7;
+  transform: none;
+}
+.dark-mode .control-button:disabled {
+    background-color: #555;
+}
+
+.control-button.active {
+  background-color: var(--button-active-bg);
+}
+
+.control-button.active:hover {
+  background-color: var(--button-active-hover-bg);
+}
+
+/* === Tablature Display === */
+#tabViewport {
+  position: relative;
+  overflow: hidden; /* Crucial: Viewport does not scroll */
+  width: 100%;
+  height: 200px; /* Increased height slightly */
+  border: 1px solid var(--border-color);
+  background-color: var(--container-bg);
+  margin-top: 25px;
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.05);
+  border-radius: 6px;
+  transition: background-color 0.3s ease, border-color 0.3s ease;
+}
+
+#tabContainer {
+  position: absolute;
+  top: 0;
+  left: 0;
+  bottom: 0;
+  right: 0;
+  overflow-x: auto; /* Container scrolls horizontally */
+  overflow-y: hidden;
+  background-color: transparent; /* Inherit from viewport or set specific */
+  -webkit-overflow-scrolling: touch; /* Smooth scrolling on iOS */
+  scrollbar-width: thin; /* Firefox */
+  scrollbar-color: var(--secondary-accent-color) var(--bg-color); /* Firefox */
+  position: relative; /* Needed for absolute positioning of children */
+}
+#tabContainer::-webkit-scrollbar {
+    height: 8px;
+}
+#tabContainer::-webkit-scrollbar-track {
+    background: var(--bg-color);
+    border-radius: 4px;
+}
+#tabContainer::-webkit-scrollbar-thumb {
+    background-color: var(--secondary-accent-color);
+    border-radius: 4px;
+    border: 2px solid var(--bg-color);
+}
+
+#tabDisplay {
+  --column-width: 20px; /* Default fallback */
+  white-space: nowrap; /* Ensure columns stay in one line */
+  display: inline-block; /* Allows container to size to content */
+  min-width: 100%; /* Ensure it fills viewport initially */
+  padding: 15px 15px 15px 0; /* Padding top/bottom/right */
+  font-family: 'Consolas', 'Menlo', 'Courier New', monospace;
+  font-size: 1.05em; /* Slightly larger tab font */
+  user-select: none;
+  position: relative; /* For absolute positioning of markers if needed */
+  overflow: visible; /* Allow content to extend outside */ 
+  
+  /* Handle very high zoom levels */
+  @media (max-width: 768px) {
+    font-size: 0.95em; /* Slightly smaller on mobile/small screens */
+  }
+}
+
+.tab-line {
+  display: flex; /* Use flex for alignment */
+  align-items: center;
+  height: 28px; /* Fixed height for vertical alignment */
+  margin-bottom: 2px; /* Small gap between lines */
+  overflow: visible; /* Ensure lines don't clip content */
+}
+
+/* String Labels (Sticky) */
+.string-label {
+  font-weight: bold;
+  color: var(--text-color);
+  display: inline-block; /* Needed for sticky */
+  width: 35px; /* Fixed width */
+  text-align: center;
+  padding: 0 5px;
+  background-color: var(--tab-label-bg); /* Different background */
+  position: sticky;
+  left: 0;
+  z-index: 20; /* Increased to stay above columns */
+  border-right: 1px solid var(--border-color);
+  transition: background-color 0.3s ease, border-color 0.3s ease, color 0.3s ease;
+}
+
+.tab-column {
+  display: inline-block;
+  width: var(--column-width); /* Use the CSS variable */
+  padding: 0; /* Remove horizontal padding to allow narrower columns */
+  text-align: center;
+  box-sizing: border-box;
+  position: relative; /* Allows z-index to work */
+  transition: background-color 0.15s ease;
+  color: var(--tab-sustained-color); /* Default to sustained color */
+  line-height: 28px; /* Match tab-line height */
+  height: 100%; /* Fill height of tab-line */
+  overflow: visible; /* Crucial: Allow content to spill out */
+  /* Handle narrow columns */
+  white-space: nowrap;
+  min-width: 4px; /* Absolute minimum width - even at max zoom */
+  /* Allow overlap management */
+  z-index: 0; /* Default z-index */
+  vertical-align: middle; /* Align content consistently */
+}
+
+.tab-column:hover {
+  background-color: var(--tab-hover-bg);
+  cursor: pointer;
+}
+
+/* Note start (fret number) */
+.tab-column.note-start {
+  font-weight: bold;
+  color: var(--tab-note-color);
+  font-size: 0.95em; /* Slightly smaller for narrow columns */
+  /* Improve readability at high zoom */
+  text-overflow: visible;
+  max-width: none;
+}
+
+/* Sustain markers (-) */
+.tab-column.sustained {
+  color: var(--tab-sustained-color);
+  /* Ensure sustained indicator is always centered and visible */
+  text-align: center;
+  font-weight: normal;
+  /* Use single hyphen for better visibility at high zoom */
+  letter-spacing: -0.5px;
+}
+
+/* Active column under playhead */
+.tab-column.active {
+  background-color: var(--note-active-bg);
+  font-weight: bold;
+  color: var(--tab-note-color) !important; /* Ensure visibility */
+  box-shadow: 0 0 5px var(--note-active-shadow);
+  position: relative;
+  z-index: 10; /* Higher z-index to appear on top */
+  border-radius: 2px;
+}
+
+/* Optional: highlight adjacent columns */
+.tab-column.prev-active,
+.tab-column.next-active {
+  background-color: rgba(128, 128, 128, 0.1); /* Subtle grey */
+}
+.dark-mode .tab-column.prev-active,
+.dark-mode .tab-column.next-active {
+  background-color: rgba(255, 255, 255, 0.08); /* Subtle grey */
+}
+
+/* Pulse animation on note play */
+@keyframes notePulse {
+  0% { background-color: var(--note-pulse-color); box-shadow: 0 0 8px var(--note-pulse-color); }
+  100% { background-color: transparent; box-shadow: none; }
+}
+
+.tab-column.playing.note-start { /* Only pulse on the note start */
+  animation: notePulse 0.7s ease-out;
+  border-radius: 2px; /* Ensure pulse has rounded corners if needed */
+}
+
+
+/* === Smooth Playhead === */
+#smoothPlayhead {
+  position: absolute;
+  top: 0;
+  left: 0; /* Initial horizontal position, will be overridden by transform */
+  width: 2px; /* Adjust thickness as desired */
+  height: 100%; /* Span the full height of the tab container */
+  background-color: var(--playhead-color); /* Use existing variable for consistency */
+  z-index: 15; /* Ensure it's above tab columns (active is 10/11) but below labels/controls */
+  pointer-events: none; /* Prevent it from interfering with mouse clicks */
+  will-change: transform; /* Performance hint for animations */
+  box-shadow: 0 0 4px var(--playhead-shadow); /* Add a subtle glow */
+}
+
+/* === Time Display === */
+
+#timePosition {
+  position: absolute;
+  /* Fixed position - will not change during scrolling */
+  bottom: -20px; /* Position below the viewport */
+  transform: translateX(-50%);
+  background-color: rgba(0, 0, 0, 0.7);
+  color: white;
+  font-family: 'Consolas', 'Menlo', 'Courier New', monospace;
+  font-size: 11px;
+  padding: 2px 6px;
+  border-radius: 3px;
+  z-index: 31;
+  white-space: nowrap;
+}
+.dark-mode #timePosition {
+    background-color: rgba(255, 255, 255, 0.8);
+    color: #000;
+}
+
+/* === Responsive Adjustments === */
+@media (max-width: 768px) {
+  body {
+    padding: 10px;
+  }
+  .container {
+    padding: 15px;
+  }
+  h1 {
+    font-size: 1.5em;
+    margin-bottom: 20px;
+  }
+  .control-row {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+  }
+  .control-row label {
+    text-align: left;
+    flex-basis: auto;
+    margin-bottom: 3px;
+  }
+  #tabViewport {
+    height: 180px; /* Adjust if needed */
+  }
+  .tab-line { height: 26px; }
+  .tab-column { min-width: 16px; }
+  .string-label { width: 30px; }
+  #timePosition {
+      left: 40px; /* Adjust for smaller label */
+  }
+}
+
+/* === Dark Mode Toggle === */
+.theme-toggle {
+  position: fixed;
+  top: 15px;
+  right: 15px;
+  width: 40px;
+  height: 40px;
+  padding: 10px;
+  background-color: var(--container-bg);
+  color: var(--text-color);
+  border: 1px solid var(--border-color);
+  border-radius: 50%;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.15);
+  transition: background-color 0.3s ease, color 0.3s ease, transform 0.2s ease;
+}
+
+.theme-toggle:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
+}
+
+.theme-toggle:active {
+  transform: translateY(0);
+}
+
+.theme-toggle-icon {
+  width: 20px;
+  height: 20px;
+  transition: transform 0.3s ease;
+}
+
+.dark-mode .theme-toggle-icon {
+  transform: rotate(40deg);
+}
+
+/* Moon icon for dark mode */
+.dark-mode .theme-toggle-icon circle {
+  fill: var(--text-color);
+}
+
+@media (max-width: 768px) {
+  .theme-toggle {
+    top: 10px;
+    right: 10px;
+    width: 36px;
+    height: 36px;
+    padding: 8px;
+  }
+}
