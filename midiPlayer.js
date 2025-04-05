@@ -54,9 +54,11 @@ function createReverb(context) {
  * @param {number} hopSize - Hop size in samples used in audio analysis.
  * @param {number} sampleRate - Sample rate of the audio in Hz.
  * @param {HTMLAudioElement} audioPlayer - Audio element to sync with
+ * @param {number} startTime - Starting time position in seconds (for standalone mode)
+ * @param {number} playbackRate - Playback rate multiplier (default: 1.0)
  * @returns {Promise<{duration: number, stop: Function}>} - Object containing playback duration and stop function
  */
-export async function playTabAsMidi(guitarTab, hopSize, sampleRate, audioPlayer = null) {
+export async function playTabAsMidi(guitarTab, hopSize, sampleRate, audioPlayer = null, startTime = 0, playbackRate = 1.0) {
   // Create a new AudioContext for audio playback
   const audioContext = new AudioContext();
 
@@ -457,20 +459,60 @@ export async function playTabAsMidi(guitarTab, hopSize, sampleRate, audioPlayer 
   }
   // Otherwise, play all notes immediately (standalone mode)
   else {
-
     // Get the current time from AudioContext for scheduling
     const now = audioContext.currentTime;
 
     // Add a slight pause before starting
     const startOffset = 0.1;
 
-    // Playback speed (default 1.0)
-    const playbackSpeed = 1.0;
+    // Use the playback rate passed directly as a parameter
+    const playbackSpeed = playbackRate;
 
-    // Schedule all notes at once
-    for (let col = 0; col < numColumns; col++) {
-      // Adjust timing by playback speed
-      const startTime = now + startOffset + (col * timePerColumn / playbackSpeed);
+    // Calculate the starting column based on the provided startTime
+    const startColumnIndex = Math.floor(startTime * sampleRate / hopSize);
+
+    // Create a virtual audio time tracker for standalone mode
+    // Initialize with provided start time
+    let virtualAudioTime = startTime;
+    let perfStartTime = performance.now() / 1000; // For tracking playback position
+    let isPlaying = true;
+
+    // Set up scroll animation for standalone mode
+    let scrollAnimationId = null;
+
+    // Function to update virtual time and scroll position
+    function updateVirtualTime() {
+      if (!isPlaying || shouldStop) {
+        cancelAnimationFrame(scrollAnimationId);
+        return;
+      }
+
+      // Calculate time passed since start, adjusted for playback speed
+      const elapsedTime = (performance.now() / 1000) - perfStartTime;
+      virtualAudioTime = startTime + (elapsedTime * playbackSpeed);
+
+      // Publish the virtual time to a custom event for main.js to use
+      window.dispatchEvent(new CustomEvent('midiTimeUpdate', {
+        detail: {
+          currentTime: virtualAudioTime,
+          duration: (numColumns * timePerColumn),
+          isPlaying: true
+        }
+      }));
+
+      // Continue the animation loop
+      scrollAnimationId = requestAnimationFrame(updateVirtualTime);
+    }
+
+    // Start the animation loop
+    scrollAnimationId = requestAnimationFrame(updateVirtualTime);
+
+    // Schedule only notes from the starting column onwards
+    for (let col = startColumnIndex; col < numColumns; col++) {
+      // Calculate time relative to the starting column
+      const columnTime = (col - startColumnIndex) * timePerColumn / playbackSpeed;
+      const noteStartTime = now + startOffset + columnTime;
+
       // Enforce a minimum duration to ensure all notes are audible
       const noteDuration = Math.max(0.1, (timePerColumn * 1.2) / playbackSpeed);
 
@@ -520,19 +562,38 @@ export async function playTabAsMidi(guitarTab, hopSize, sampleRate, audioPlayer 
 
             // Velocity slightly higher for stand-alone mode
             const velocity = 0.9;
-            createGuitarTone(frequency, startTime, totalDuration, s, velocity);
+            createGuitarTone(frequency, noteStartTime, totalDuration, s, velocity);
           }
         }
       }
     }
 
-    // Total duration of playback (adjusted for playback speed)
-    const duration = (numColumns * timePerColumn) / playbackSpeed;
+    // Total duration of playback (adjusted for playback speed and start position)
+    const fullDuration = (numColumns * timePerColumn);
+    const remainingDuration = (numColumns - startColumnIndex) * timePerColumn / playbackSpeed;
 
-    // Return duration and stop function for standalone mode
+    // Enhanced stop function for standalone mode
+    const enhancedStopAudio = () => {
+      isPlaying = false;
+      if (scrollAnimationId) {
+        cancelAnimationFrame(scrollAnimationId);
+      }
+
+      // Signal that MIDI playback has stopped
+      window.dispatchEvent(new CustomEvent('midiTimeUpdate', {
+        detail: {
+          isPlaying: false
+        }
+      }));
+
+      cleanupAudio();
+    };
+
+    // Return duration and enhanced stop function for standalone mode
     return {
-      duration: duration + startOffset,
-      stop: cleanupAudio
+      duration: fullDuration, // Full duration of the tab for reference
+      stop: enhancedStopAudio,
+      remainingDuration: remainingDuration + startOffset // For timing the auto-stop
     };
   }
 
