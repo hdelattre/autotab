@@ -112,7 +112,7 @@ const playheadState = {
   updatingFromMidi: false,
   // Current playback rate
   playbackRate: 1.0,
-  
+
   // Method to update time from audio
   updateFromAudio: function(audioPlayer) {
     if (!this.updatingFromMidi) {
@@ -120,7 +120,7 @@ const playheadState = {
       this.totalDuration = audioPlayer.duration;
     }
   },
-  
+
   // Method to apply current playhead position to audio
   applyToAudio: function(audioPlayer) {
     audioPlayer.currentTime = this.currentTime;
@@ -156,7 +156,7 @@ window.addEventListener('load', () => {
 
   // Add click handler for tab navigation
   tabContainer.addEventListener('click', handleTabClick);
-  
+
   // Add listener for MIDI virtual time updates from standalone MIDI playback
   window.addEventListener('midiTimeUpdate', (event) => {
     if (event.detail) {
@@ -219,7 +219,7 @@ function handleTabClick(event) {
 
   // Update unified playhead position
   playheadState.currentTime = timePosition;
-  
+
   // If MIDI is not controlling playback, also update audio position
   if (!playheadState.updatingFromMidi) {
     // Set audio position
@@ -494,18 +494,18 @@ function updateScroll() {
 
   // Track if we're in MIDI-only mode
   const midiOnlyMode = midiPlayback && audioPlayer.paused;
-  
+
   // Update the unified playhead from audio if needed
   if (!midiOnlyMode && audioPlayer.duration > 0) {
     playheadState.updateFromAudio(audioPlayer);
   }
-  
+
   // Use playhead for all timing
   if ((sampleRate && audioPlayer.duration > 0 && currentGuitarTab) || midiOnlyMode) {
     // Get times from unified playhead
     let currentTime = playheadState.currentTime;
     let totalDuration = playheadState.totalDuration;
-    
+
     // Fall back to calculated duration if needed
     if (totalDuration <= 0 && currentGuitarTab) {
       totalDuration = currentGuitarTab[0].length * HOP_SIZE / sampleRate;
@@ -644,106 +644,138 @@ function updateActiveColumn(newColumnIndex, className = 'active') {
   setLastIndex(newColumnIndex);
 }
 
+/**
+ * Start MIDI playback in sync mode with the audio player
+ * @returns {Promise<Object>} The MIDI playback controller
+ */
+async function startSyncedMidiPlayback() {
+  try {
+    // Set button to active state
+    toggleMidiButton.textContent = 'Stop MIDI';
+    toggleMidiButton.classList.add('active');
+
+    // Create a label to show sync mode
+    const syncLabel = document.createElement('span');
+    syncLabel.className = 'sync-label';
+    syncLabel.textContent = 'Synced with audio';
+    toggleMidiButton.parentNode.appendChild(syncLabel);
+
+    // Lower the audio track volume to hear the MIDI better
+    const originalVolume = audioPlayer.volume;
+    audioPlayer.dataset.originalVolume = originalVolume;
+    audioPlayer.volume = Math.max(0.3, originalVolume * 0.6);
+
+    // Play the tab as MIDI synchronized with the audio player
+    const playback = await playTabAsMidi(currentGuitarTab, HOP_SIZE, sampleRate, audioPlayer);
+
+    // Set up a handler to clean up when audio ends
+    const audioEndHandler = () => {
+      if (midiPlayback) {
+        stopMidiPlayback();
+        // Remove this handler
+        audioPlayer.removeEventListener('ended', audioEndHandler);
+      }
+    };
+
+    audioPlayer.addEventListener('ended', audioEndHandler);
+
+    return playback;
+  } catch (error) {
+    console.error('Error starting synced MIDI playback:', error);
+
+    cleanupMidiUI();
+
+    return null;
+  }
+}
+
+/**
+ * Start MIDI playback in standalone mode
+ * @param {number} startPosition - The position to start from (in seconds)
+ * @returns {Promise<Object>} The MIDI playback controller
+ */
+async function startStandaloneMidiPlayback(startPosition) {
+  try {
+    // Set button to active state
+    toggleMidiButton.textContent = 'Stop MIDI';
+    toggleMidiButton.classList.add('active');
+
+    // Create a label to show mode
+    const syncLabel = document.createElement('span');
+    syncLabel.className = 'sync-label';
+    syncLabel.textContent = 'MIDI only';
+    toggleMidiButton.parentNode.appendChild(syncLabel);
+
+    // Play the tab as standalone MIDI without synchronization
+    const playback = await playTabAsMidi(
+      currentGuitarTab,
+      HOP_SIZE,
+      sampleRate,
+      null,
+      startPosition,
+      playbackRate
+    );
+
+    const autoStopTimeoutId = setTimeout(() => {
+      if (midiPlayback === playback) {
+        stopMidiPlayback();
+      }
+    }, playback.remainingDuration * 1000 + 500);
+
+    // Store the timeout ID in the playback object for cleanup
+    playback.autoStopTimeoutId = autoStopTimeoutId;
+
+    return playback;
+  } catch (error) {
+    console.error('Error starting standalone MIDI playback:', error);
+    cleanupMidiUI();
+    return null;
+  }
+}
+
+/**
+ * Main function to start MIDI playback in the appropriate mode
+ */
 async function startMidiPlayback() {
   if (midiPlayback) { return; }
-  // Only play if we have guitar tab data
-  if (currentGuitarTab) {
-    try {
-      // Set button to active state
-      toggleMidiButton.textContent = 'Stop MIDI';
-      toggleMidiButton.classList.add('active');
+  if (!currentGuitarTab) { return; }
 
-      // Create a label to show the current mode
-      const syncLabel = document.createElement('span');
-      syncLabel.className = 'sync-label';
-      syncLabel.textContent = audioPlayer.paused ? 'MIDI only' : 'Synced with audio';
-      toggleMidiButton.parentNode.appendChild(syncLabel);
-
-      // Get position from unified playhead
-      const currentPlayheadPosition = Math.max(0, playheadState.currentTime);
-
-      // If we're in sync mode, lower the audio volume to hear MIDI better
-      if (!audioPlayer.paused) {
-        // Save original volume to restore later
-        const originalVolume = audioPlayer.volume;
-        audioPlayer.dataset.originalVolume = originalVolume;
-        // Lower the audio track volume to hear the MIDI better
-        audioPlayer.volume = Math.max(0.3, originalVolume * 0.6);
-      }
-
-      // If audio is playing, use synchronized mode, otherwise standalone mode
-      if (!audioPlayer.paused) {
-        // Play the tab as MIDI synchronized with the audio player
-        midiPlayback = await playTabAsMidi(currentGuitarTab, HOP_SIZE, sampleRate, audioPlayer);
-
-        // Set up a handler to clean up when audio ends
-        const audioEndHandler = () => {
-          if (midiPlayback) {
-            stopMidiPlayback();
-
-            // Remove this handler
-            audioPlayer.removeEventListener('ended', audioEndHandler);
-          }
-        };
-
-        audioPlayer.addEventListener('ended', audioEndHandler);
-      } else {
-        // Play the tab as standalone MIDI without synchronization
-        // Pass the current playhead position and playback rate
-        midiPlayback = await playTabAsMidi(
-          currentGuitarTab, 
-          HOP_SIZE, 
-          sampleRate, 
-          null, 
-          currentPlayheadPosition,
-          playbackRate
-        );
-
-        // Automatically reset button when playback finishes
-        setTimeout(() => {
-          if (midiPlayback) {
-            stopMidiPlayback();
-          }
-        }, midiPlayback.remainingDuration * 1000 + 500); // Use the calculated remaining duration
-      }
-    } catch (error) {
-      console.error('Error playing MIDI:', error);
-      toggleMidiButton.textContent = 'Play MIDI';
-      toggleMidiButton.classList.remove('active');
-
-      // Remove any sync label
-      const existingLabels = document.querySelectorAll('.sync-label');
-      existingLabels.forEach(label => label.parentNode.removeChild(label));
-    }
+  const currentPlayheadPosition = Math.max(0, playheadState.currentTime);
+  if (!audioPlayer.paused) {
+    midiPlayback = await startSyncedMidiPlayback();
   } else {
-    console.warn('No guitar tab data available for MIDI playback');
-    // Alert the user that they need to load audio first
-    alert('Please load an audio file first to detect guitar tabs');
+    midiPlayback = await startStandaloneMidiPlayback(currentPlayheadPosition);
+  }
+
+  if (!midiPlayback) {
+    cleanupMidiUI();
   }
 }
 
 function stopMidiPlayback() {
   if (midiPlayback == null) { return; }
 
+  // Clear any auto-stop timeout if present
+  if (midiPlayback.autoStopTimeoutId) {
+    clearTimeout(midiPlayback.autoStopTimeoutId);
+    midiPlayback.autoStopTimeoutId = null;
+  }
+
   // Stop the actual MIDI playback
   midiPlayback.stop();
   midiPlayback = null;
-  toggleMidiButton.textContent = 'Play MIDI';
-  toggleMidiButton.classList.remove('active');
 
-  // Remove any sync mode label
-  const existingLabels = document.querySelectorAll('.sync-label');
-  existingLabels.forEach(label => label.parentNode.removeChild(label));
+  cleanupMidiUI();
 
   // Restore original audio volume if it was changed
   if (audioPlayer.dataset.originalVolume) {
     audioPlayer.volume = parseFloat(audioPlayer.dataset.originalVolume);
     delete audioPlayer.dataset.originalVolume;
   }
-  
+
   // Mark MIDI as no longer controlling the playhead
   playheadState.updatingFromMidi = false;
-  
+
   // If audio is loaded, update the audio position to match the unified playhead
   if (audioPlayer.src && audioPlayer.duration > 0) {
     // Only set if the difference is significant
@@ -751,6 +783,15 @@ function stopMidiPlayback() {
       audioPlayer.currentTime = playheadState.currentTime;
     }
   }
+}
+
+function cleanupMidiUI() {
+  toggleMidiButton.textContent = 'Play MIDI';
+  toggleMidiButton.classList.remove('active');
+
+  // Remove any sync mode label
+  const existingLabels = document.querySelectorAll('.sync-label');
+  existingLabels.forEach(label => label.parentNode.removeChild(label));
 }
 
 /**
@@ -919,7 +960,7 @@ zoomSlider.addEventListener('input', () => {
 tempoSlider.addEventListener('input', () => {
   playbackRate = parseFloat(tempoSlider.value);
   tempoValue.textContent = `${playbackRate.toFixed(1)}x`;
-  
+
   // Update unified playhead state
   playheadState.playbackRate = playbackRate;
 
@@ -933,7 +974,7 @@ tempoSlider.addEventListener('input', () => {
     const wasPlaying = true;
     // Stop current playback
     stopMidiPlayback();
-    
+
     // Restart with new tempo
     if (wasPlaying) {
       setTimeout(() => {
@@ -945,9 +986,24 @@ tempoSlider.addEventListener('input', () => {
 });
 
 // Playing state change handlers
-audioPlayer.addEventListener('play', () => {
-  // Update unified playhead to indicate audio is in control
-  if (!playheadState.updatingFromMidi) {
+audioPlayer.addEventListener('play', async () => {
+  // Check if MIDI is currently playing
+  const midiWasPlaying = midiPlayback !== null;
+
+  // If MIDI is playing but not in sync mode, we need to restart it in sync mode
+  if (midiWasPlaying) {
+    // First stop the current MIDI playback
+    stopMidiPlayback();
+
+    // Now restart MIDI in sync mode with audio using our refactored function
+    midiPlayback = await startSyncedMidiPlayback();
+
+    if (!midiPlayback) {
+      console.error('Failed to resync MIDI with audio');
+    }
+  } else {
+    // Normal case - just update unified playhead to indicate audio is in control
+    playheadState.updatingFromMidi = false;
     playheadState.updateFromAudio(audioPlayer);
   }
 });
@@ -965,7 +1021,7 @@ audioPlayer.addEventListener('seeking', () => {
     if (!playheadState.updatingFromMidi) {
       playheadState.updateFromAudio(audioPlayer);
     }
-    
+
     const currentTime = playheadState.currentTime;
     const exactColumnIndex = timeToColumnIndex(currentTime, sampleRate, HOP_SIZE);
     const desiredScrollLeft = calculateScrollPosition(exactColumnIndex);
