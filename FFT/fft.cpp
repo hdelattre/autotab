@@ -6,7 +6,10 @@
 static float* twiddleReal = nullptr;
 static float* twiddleImag = nullptr;
 static int* bitReversalIndices = nullptr;
+static int currentFFTSize = 0;
 static std::vector<std::vector<float>> cqtKernelReal, cqtKernelImag;
+static bool cqtInitialized = false;
+static int cqtFFTSize = 0;
 
 extern "C" {
 
@@ -20,6 +23,18 @@ bool initFFT(int n) {
     if (!isPowerOfTwo(n)) {
         return false;
     }
+
+    // If already initialized with the same size, just return success
+    if (currentFFTSize == n && twiddleReal && twiddleImag && bitReversalIndices) {
+        return true;
+    }
+
+    // Free existing allocations if any
+    if (twiddleReal) { free(twiddleReal); twiddleReal = nullptr; }
+    if (twiddleImag) { free(twiddleImag); twiddleImag = nullptr; }
+    if (bitReversalIndices) { free(bitReversalIndices); bitReversalIndices = nullptr; }
+    currentFFTSize = 0;
+
     twiddleReal = static_cast<float*>(malloc(n / 2 * sizeof(float)));
     twiddleImag = static_cast<float*>(malloc(n / 2 * sizeof(float)));
     if (!twiddleReal || !twiddleImag) {
@@ -36,7 +51,6 @@ bool initFFT(int n) {
     if (!bitReversalIndices) {
         free(twiddleReal); free(twiddleImag);
         twiddleReal = nullptr; twiddleImag = nullptr;
-        bitReversalIndices = nullptr;
         return false;
     }
     int j = 0;
@@ -46,12 +60,13 @@ bool initFFT(int n) {
         while (j & bit) { j ^= bit; bit >>= 1; }
         j ^= bit;
     }
+    currentFFTSize = n;
     return true;
 }
 
 EMSCRIPTEN_KEEPALIVE
 bool fft(float* real, float* imag, int n) {
-    if (!isPowerOfTwo(n) || !real || !imag || !twiddleReal || !bitReversalIndices) {
+    if (!isPowerOfTwo(n) || !real || !imag || !twiddleReal || !bitReversalIndices || currentFFTSize != n) {
         return false;
     }
     for (int i = 0; i < n; i++) {
@@ -100,16 +115,33 @@ bool initCQT(int binsPerOctave, int octaves, int n, float sampleRate, float minF
     if (binsPerOctave <= 0 || octaves <= 0 || n <= 0 || sampleRate <= 0 || minFreq <= 0) {
         return false;
     }
+    if (!isPowerOfTwo(n)) {
+        return false;
+    }
+
+    // Check if already initialized with same parameters
+    if (cqtInitialized && cqtFFTSize == n &&
+        cqtKernelReal.size() == static_cast<size_t>(binsPerOctave * octaves)) {
+        // Could add more parameter checking here if needed
+        return true;
+    }
+
     int totalBins = binsPerOctave * octaves;
+    cqtKernelReal.clear();
+    cqtKernelImag.clear();
     cqtKernelReal.resize(totalBins, std::vector<float>(n, 0.0f));
     cqtKernelImag.resize(totalBins, std::vector<float>(n, 0.0f));
+
     float Q = 1.0f / (powf(2.0f, 1.0f / binsPerOctave) - 1.0f);
+
     for (int k = 0; k < totalBins; k++) {
         float freq = minFreq * powf(2.0f, static_cast<float>(k) / binsPerOctave);
         if (freq <= 0 || freq >= sampleRate / 2) continue;
+
         int filterLen = static_cast<int>(ceilf(Q * sampleRate / freq));
         if (filterLen > n) filterLen = n;
         if (filterLen <= 0) continue;
+
         std::vector<float> tempReal(n, 0.0f), tempImag(n, 0.0f);
         float invFilterLenMinus1 = 1.0f / (filterLen - 1);
         for (int i = 0; i < filterLen; i++) {
@@ -118,14 +150,21 @@ bool initCQT(int binsPerOctave, int octaves, int n, float sampleRate, float minF
             tempReal[i] = window * cosf(2.0f * M_PI * freq * t / sampleRate);
             tempImag[i] = window * sinf(2.0f * M_PI * freq * t / sampleRate);
         }
+
         if (!fft(tempReal.data(), tempImag.data(), n)) {
+            cqtInitialized = false;
+            cqtFFTSize = 0;
             return false;
         }
+
         for (int i = 0; i < n; i++) {
             cqtKernelReal[k][i] = tempReal[i];
             cqtKernelImag[k][i] = tempImag[i];
         }
     }
+
+    cqtInitialized = true;
+    cqtFFTSize = n;
     return true;
 }
 
@@ -134,10 +173,15 @@ bool cqt(float* inputReal, float* inputImag, float* outputReal, float* outputIma
     if (!inputReal || !inputImag || !outputReal || !outputImag || binsPerOctave <= 0 || octaves <= 0 || n <= 0) {
         return false;
     }
+    if (!cqtInitialized) {
+        return false;
+    }
+
     int totalBins = binsPerOctave * octaves;
     if (totalBins > static_cast<int>(cqtKernelReal.size())) {
         return false;
     }
+
     float invN = 1.0f / n;
     for (int k = 0; k < totalBins; k++) {
         float sumReal = 0.0f, sumImag = 0.0f;
@@ -153,20 +197,20 @@ bool cqt(float* inputReal, float* inputImag, float* outputReal, float* outputIma
 
 EMSCRIPTEN_KEEPALIVE
 bool freeFFT() {
-    if (twiddleReal) free(twiddleReal);
-    if (twiddleImag) free(twiddleImag);
-    if (bitReversalIndices) free(bitReversalIndices);
-    twiddleReal = nullptr;
-    twiddleImag = nullptr;
-    bitReversalIndices = nullptr;
-    return true; // Always succeeds since we don't care about failure here
+    if (twiddleReal) { free(twiddleReal); twiddleReal = nullptr; }
+    if (twiddleImag) { free(twiddleImag); twiddleImag = nullptr; }
+    if (bitReversalIndices) { free(bitReversalIndices); bitReversalIndices = nullptr; }
+    currentFFTSize = 0;
+    return true;
 }
 
 EMSCRIPTEN_KEEPALIVE
 bool freeCQT() {
     cqtKernelReal.clear();
     cqtKernelImag.clear();
-    return true; // Always succeeds since clear() can't fail in this context
+    cqtInitialized = false;
+    cqtFFTSize = 0;
+    return true;
 }
 
 } // extern "C"
