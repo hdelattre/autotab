@@ -54,6 +54,17 @@
   --tab-hover-bg: rgba(255, 255, 255, 0.05);
 }
 
+/* Performance optimizations */
+#smoothPlayhead {
+  will-change: transform;
+  contain: layout style paint;
+}
+
+#tabContainer {
+  will-change: scroll-position;
+  -webkit-overflow-scrolling: touch;
+}
+
 *, *::before, *::after {
   box-sizing: border-box;
 }
