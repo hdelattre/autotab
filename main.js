@@ -11,68 +11,45 @@ let columnWidth = 0;
 let labelWidthPx = 35;
 let playbackRate = 1.0;
 let columnElements = [];
-let lastActiveIndex = -1;
-let lastPrevActiveIndex = -1;
-let lastNextActiveIndex = -1;
 let effectiveColumnWidthCache = MIN_COLUMN_WIDTH_RENDERED;
 
-// Import the MIDI player module
-import { playTabAsMidi } from './midiPlayer.js';
+// Import new MIDI player, virtual scroller, and MIDI exporter
+import { MidiPlayer } from './midiPlayer.js';
+import { VirtualScroller } from './virtualScroller.js';
+import { MidiExporter } from './midiExporter.js';
 
 /** @typedef {string[][]} GuitarTab - 2D array representing the guitar tab (6 strings, multiple columns) */
 /** @typedef {{fret: string, sustained: boolean, isFirstNote: boolean}} TabNote - Processed note info */
 
 /**
  * @param {number} time
- * @param {number} sampleRate
- * @param {number} hopSize
  * @returns {number}
  */
-function timeToColumnIndex(time, sampleRate, hopSize) {
-  // Calculate column index directly from audio parameters
-  // Removing the 0.5 factor for correct time-to-column mapping
-  return (time * sampleRate) / hopSize;
+function timeToColumnIndex(time) {
+  return (time * sampleRate) / HOP_SIZE;
 }
 
 /**
- * @param {number} columnIndex
- * @param {number} sampleRate
- * @param {number} hopSize
+ * @param {number} idx
  * @returns {number} Time position in seconds
  */
-function columnIndexToTime(columnIndex, sampleRate, hopSize) {
-  // The inverse of timeToColumnIndex
-  return (columnIndex * hopSize) / sampleRate;
+function columnIndexToTime(idx) {
+  return (idx * HOP_SIZE) / sampleRate;
 }
 
 /**
- * @param {number} columnIndex
+ * @param {number} idx
  * @returns {number} Scroll position in pixels
  */
-function calculateScrollPosition(columnIndex) {
-  // Define fixed playhead target position
-  const fixedPlayheadViewportX = labelWidthPx + PLAYHEAD_FIXED_OFFSET_PX;
-
-  // Use the cached effective width for better performance
-  const effectiveColumnWidth = effectiveColumnWidthCache;
-
-  // Split columnIndex into integer and fractional parts for precise interpolation
-  const intColumnIndex = Math.floor(columnIndex);
-  const fraction = columnIndex - intColumnIndex;
-
-  // Calculate position using full precision (exact fractional position)
-  // This ensures smooth scrolling between columns at high zoom levels
-  const columnPositionPx = intColumnIndex * effectiveColumnWidth + (fraction * effectiveColumnWidth);
-
-  // Calculate scroll position that would put this column at the fixed playhead position
-  let scrollPosition = columnPositionPx - fixedPlayheadViewportX;
-
-  // Handle edge cases - make sure we don't exceed scroll bounds
+function calculateScrollPosition(idx) {
+  const fixedX = labelWidthPx + PLAYHEAD_FIXED_OFFSET_PX;
+  // Use the actual column width that matches the CSS, not the effective width
+  const actualColumnWidth = columnWidth || MIN_COLUMN_WIDTH_CALC;
+  const px = idx * actualColumnWidth; // Simplified - idx already includes fraction
+  let scrollPos = px - fixedX;
   const maxScroll = tabContainer.scrollWidth - tabContainer.clientWidth;
-  scrollPosition = Math.max(0, Math.min(scrollPosition, maxScroll));
-
-  // Use Math.round instead of floor for more accurate positioning
-  return Math.round(scrollPosition);
+  scrollPos = Math.max(0, Math.min(scrollPos, maxScroll));
+  return scrollPos; // Don't round for smoother scrolling
 }
 
 const audioInput = document.getElementById('audioInput');
@@ -88,6 +65,7 @@ const zoomValue = document.getElementById('zoomValue');
 const tempoSlider = document.getElementById('tempoSlider');
 const tempoValue = document.getElementById('tempoValue');
 const toggleMidiButton = document.getElementById('toggleMidiButton');
+const exportMidiButton = document.getElementById('exportMidiButton');
 const smoothPlayhead = document.getElementById('smoothPlayhead');
 
 // Web Worker (initialized lazily)
@@ -96,9 +74,18 @@ let worker = null;
 let cachedAudioData = null;
 // Store the current guitar tab data and MIDI playback controller
 let currentGuitarTab = null;
-let midiPlayback = null;
+let currentNotes = null;
+let currentChords = null;
+let currentConfidenceMap = null;
+let midiPlayer = null;
 // Animation frame request ID
 let animationFrameId = null;
+// Virtual scroller instance
+let virtualScroller = null;
+let useVirtualScrolling = true; // Feature flag
+// MIDI exporter instance
+let midiExporter = new MidiExporter();
+
 
 // Define a unified playhead state tracker
 const playheadState = {
@@ -127,11 +114,40 @@ const playheadState = {
   }
 };
 
+// Ensure worker function
+function ensureWorker() {
+  if (worker) return;
+  worker = new Worker('worker.js', { type: 'module' });
+  worker.onmessage = (e) => {
+    if (e.data.error) {
+      console.error(e.data.error);
+      tabDisplay.innerHTML = `<pre>Error: ${e.data.error}</pre>`;
+      return;
+    }
+    const { guitarTab, notes, chords, confidenceMap } = e.data;
+    currentGuitarTab = guitarTab;
+    currentNotes = notes;
+    currentChords = chords;
+    currentConfidenceMap = confidenceMap;
+    toggleMidiButton.disabled = !guitarTab;
+    exportMidiButton.disabled = !guitarTab;
+    renderTab(guitarTab, confidenceMap);
+  };
+  worker.onerror = (err) => {
+    console.error(err);
+    tabDisplay.innerHTML = '<pre>Error: Processing failed</pre>';
+  };
+}
+
+// Global event listeners (only added once)
+let midiTimeUpdateHandler = null;
+let tabClickHandler = null;
+
 // Initialize on page load
 window.addEventListener('load', () => {
   // Set initial slider values
   zoomValue.textContent = `${DEFAULT_DISPLAY_WINDOW_SECONDS.toFixed(1)} seconds`;
-  sensitivityValue.textContent = `${(parseFloat(sensitivitySlider.value) * 100).toFixed(1)}%`;
+  sensitivityValue.textContent = `${(parseFloat(sensitivitySlider.value) * 100).toFixed(0)}%`;
   tempoValue.textContent = `${parseFloat(tempoSlider.value).toFixed(1)}x`;
 
   // Calculate initial column width
@@ -154,23 +170,23 @@ window.addEventListener('load', () => {
     animationFrameId = requestAnimationFrame(updateScroll);
   }
 
-  // Add click handler for tab navigation
-  tabContainer.addEventListener('click', handleTabClick);
+  // Add click handler for tab navigation (only once)
+  if (!tabClickHandler) {
+    tabClickHandler = handleTabClick;
+    tabContainer.addEventListener('click', tabClickHandler);
+  }
 
-  // Add listener for MIDI virtual time updates from standalone MIDI playback
-  window.addEventListener('midiTimeUpdate', (event) => {
-    if (event.detail) {
-      // Update the unified playhead from MIDI events
-      if (event.detail.currentTime !== undefined) {
+  // Listen for MIDI-specific events (only once)
+  if (!midiTimeUpdateHandler) {
+    midiTimeUpdateHandler = (event) => {
+      if (event.detail && midiPlayer) {
+        // MIDI player time update
         playheadState.currentTime = event.detail.currentTime;
-        // Mark that MIDI is currently controlling the playhead
-        playheadState.updatingFromMidi = event.detail.isPlaying === true;
+        playheadState.updatingFromMidi = event.detail.isPlaying && midiPlayer;
       }
-      if (event.detail.duration !== undefined) {
-        playheadState.totalDuration = event.detail.duration;
-      }
-    }
-  });
+    };
+    window.addEventListener('midiTimeUpdate', midiTimeUpdateHandler);
+  }
 });
 
 
@@ -189,33 +205,25 @@ function handleTabClick(event) {
     return;
   }
 
-  // Get all columns to calculate index
-  const columns = tabDisplay.querySelectorAll('.tab-column');
-  const columnsArray = Array.from(columns);
+  // Get the column index directly from the data attribute
+  const columnIndex = parseInt(clickTarget.dataset.column);
+  const stringIndex = parseInt(clickTarget.dataset.string);
 
-  // Find the index of the clicked column
-  const clickedColumn = columnsArray.indexOf(clickTarget);
-  if (clickedColumn === -1) return;
-
-  // Find which string (line) this is in
-  const stringIndex = Math.floor(clickedColumn / (currentGuitarTab[0].length));
-
-  // Calculate actual column index in the tab data
-  const columnIndex = clickedColumn % currentGuitarTab[0].length;
+  if (isNaN(columnIndex) || isNaN(stringIndex)) return;
 
   // Get more precise click position within the column (for better accuracy)
   const rect = clickTarget.getBoundingClientRect();
   const clickXWithinColumn = event.clientX - rect.left;
 
-  // Get the effective column width for accurate pixel calculations
-  const effectiveWidth = getEffectiveColumnWidth();
+  // Get the actual column width for accurate pixel calculations
+  const actualColumnWidth = columnWidth || MIN_COLUMN_WIDTH_CALC;
 
   // Calculate fraction of column (for sub-column precision)
-  const fraction = clickXWithinColumn / effectiveWidth;
+  const fraction = clickXWithinColumn / actualColumnWidth;
   const exactColumnIndex = columnIndex + fraction;
 
   // Convert column index to time
-  const timePosition = columnIndexToTime(exactColumnIndex, sampleRate, HOP_SIZE);
+  const timePosition = columnIndexToTime(exactColumnIndex);
 
   // Update unified playhead position
   playheadState.currentTime = timePosition;
@@ -232,51 +240,58 @@ function handleTabClick(event) {
   tabContainer.scrollLeft = scrollPos;
 
   // Force smooth playhead position update
-  const playheadPixelX = (exactColumnIndex * effectiveColumnWidthCache) + labelWidthPx;
+  const playheadPixelX = (exactColumnIndex * actualColumnWidth) + labelWidthPx;
   smoothPlayhead.style.transform = `translateX(${playheadPixelX}px)`;
   smoothPlayhead.style.display = 'block'; // Ensure visible
 
   // Force background highlight update
   updateActiveColumn(Math.floor(exactColumnIndex));
 
-  // If audio was playing and we're using MIDI, need to reset the MIDI playback
-  if (!audioPlayer.paused && midiPlayback) {
-    // Seeking is handled automatically by the MIDI player's seek event handler
-  }
+  // If audio was playing and we're using MIDI, seeking is handled automatically
 }
 
 /**
  * @param {GuitarTab} guitarTab
+ * @param {number[][]} confidenceMap - Optional confidence scores for each note
  * @returns {void}
  */
-function renderTab(guitarTab) {
+function renderTab(guitarTab, confidenceMap = null) {
   // Validate guitarTab structure
-  if (!Array.isArray(guitarTab) || guitarTab.length !== 6 || !guitarTab.every(row => Array.isArray(row))) {
-    console.error('Invalid guitarTab: Must be a 6-row 2D array');
+  if (!Array.isArray(guitarTab) || guitarTab.length === 0 || !guitarTab.every(row => Array.isArray(row))) {
+    console.error('Invalid guitarTab: Must be a non-empty 2D array');
     tabDisplay.innerHTML = '<pre>Error: Invalid tablature data</pre>';
     return;
   }
 
+  const numStrings = guitarTab.length;
   const numColumns = guitarTab[0].length;
-  const stringNames = ['e', 'B', 'G', 'D', 'A', 'E'];
+
+  // Ensure column width is calculated before rendering
+  if (!columnWidth || columnWidth <= 0) {
+    calculateColumnWidth();
+  }
+  const stringNames = numStrings === 6 ? ['e', 'B', 'G', 'D', 'A', 'E'] :
+    Array(numStrings).fill(null).map((_, i) => `S${i+1}`);
+
+  // Use virtual scrolling for large tabs
+  if (useVirtualScrolling && numColumns > 500) {
+    renderTabVirtual(guitarTab);
+    return;
+  }
 
   // Reset cache for column elements
   columnElements = [];
   tabDisplay.innerHTML = '';
 
-  // Reset last indices when re-rendering
-  lastActiveIndex = -1;
-  lastPrevActiveIndex = -1;
-  lastNextActiveIndex = -1;
 
   // Calculate expected column count based on audio duration (if we have audio loaded)
   let expectedColumns = numColumns;
   if (audioPlayer.duration) {
-    expectedColumns = timeToColumnIndex(audioPlayer.duration, sampleRate, HOP_SIZE);
+    expectedColumns = timeToColumnIndex(audioPlayer.duration);
   }
 
   // Create tab for each string
-  for (let s = 5; s >= 0; s--) {
+  for (let s = numStrings - 1; s >= 0; s--) {
     if (guitarTab[s].length !== numColumns) {
       console.warn(`String ${s} has inconsistent length`);
       continue;
@@ -289,42 +304,54 @@ function renderTab(guitarTab) {
     // Add string label with fixed width for alignment
     const label = document.createElement('span');
     label.className = 'string-label';
-    label.textContent = stringNames[5 - s].padEnd(2, ' ') + '|'; // Include the pipe in the label
+    const stringLabel = stringNames[numStrings - 1 - s] || `S${s+1}`;
+    label.textContent = stringLabel.padEnd(2, ' ') + '|'; // Include the pipe in the label
     line.appendChild(label);
 
     // Process the tab data to identify sustained notes
     const processedTab = processSustainedNotes(guitarTab[s]);
 
-    // Add each fret/note as a separate column with fixed width
-    processedTab.forEach((fretInfo, i) => {
-      const column = document.createElement('span');
-      column.className = 'tab-column';
-      // Make sure data-column attribute is set correctly for our position checks
-      column.setAttribute('data-column', i);
-      column.setAttribute('data-string', s);
+    const stringCols = [];
+    processedTab.forEach((info, i) => {
+      const span = document.createElement('span');
+      span.className = 'tab-column';
+      span.dataset.column = i;
+      span.dataset.string = s;
+      let txt = String(info.fret);
+      const extra = [];
+      if (txt.includes('b')) { extra.push('bend-up'); txt = txt.replace('b', ''); }
+      if (txt.includes('r')) { extra.push('bend-down'); txt = txt.replace('r', ''); }
+      if (/[hH]/.test(txt)) { extra.push('hammer-on'); txt = txt.replace(/[hH]/g, ''); }
+      if (txt.includes('p')) { extra.push('pull-off'); txt = txt.replace('p', ''); }
+      if (txt.includes('~')) { extra.push('vibrato'); txt = txt.replace('~', ''); }
 
-      // Add appropriate classes and content based on note status
-      if (fretInfo.sustained) {
-        column.classList.add('sustained');
-        // Use a horizontal line for sustained notes - shorter for narrow widths
-        column.textContent = '-';
+      // Add confidence indicator if available
+      if (confidenceMap && confidenceMap[s] && confidenceMap[s][i] !== undefined) {
+        const confidence = confidenceMap[s][i];
+        span.dataset.confidence = confidence.toFixed(2);
 
-        // Store the actual fret number as a data attribute for reference
-        if (fretInfo.actualFret) {
-          column.setAttribute('data-fret', fretInfo.actualFret);
+        // Add confidence class based on level
+        if (confidence < 0.3) {
+          extra.push('low-confidence');
+        } else if (confidence < 0.7) {
+          extra.push('medium-confidence');
+        } else {
+          extra.push('high-confidence');
         }
-      } else if (fretInfo.isFirstNote) {
-        // This is the starting point of a note, add active class
-        column.classList.add('note-start');
-        // Don't pad the fret number to allow for narrower columns
-        column.textContent = String(fretInfo.fret);
-      } else {
-        // This is an empty space
-        column.textContent = String(fretInfo.fret);
       }
 
-      line.appendChild(column);
-      lineColumns.push(column); // Store reference to this column
+      if (info.sustained) {
+        span.classList.add('sustained');
+        span.textContent = '~';
+      } else if (info.isFirstNote) {
+        span.classList.add('note-start', ...extra);
+        span.textContent = txt;
+      } else {
+        span.classList.add(...extra);
+        span.textContent = txt;
+      }
+      line.appendChild(span);
+      stringCols.push(span);
     });
 
     // Add pipe after frets
@@ -335,8 +362,8 @@ function renderTab(guitarTab) {
     tabDisplay.appendChild(line);
 
     // Store line's columns in our 2D array
-    // 5-s to flip the order so columnElements[0] is the lowest string (E)
-    columnElements[5-s] = lineColumns;
+    // Flip the order so columnElements[0] is the lowest string
+    columnElements[numStrings - 1 - s] = stringCols;
   }
 
   // Calculate the width needed for the entire song
@@ -391,44 +418,52 @@ function renderTab(guitarTab) {
 }
 
 /**
- * @param {string[]} tabRow
+ * @param {string[]} row
  * @returns {TabNote[]}
  */
-function processSustainedNotes(tabRow) {
-  const result = [];
+function processSustainedNotes(row) {
+  const out = [];
+  for (let i = 0; i < row.length; i++) {
+    const t = row[i];
+    if (t === '-') out.push({ fret: '-', sustained: false, isFirstNote: false });
+    else if (t === '-' || t.startsWith('s')) {
+      const num = t.startsWith('s') ? t.substring(1) : null;
+      out.push({ fret: '-', sustained: true, actualFret: num, isFirstNote: false });
+    } else out.push({ fret: t, sustained: false, isFirstNote: true });
+  }
+  return out;
+}
 
-  for (let i = 0; i < tabRow.length; i++) {
-    const currentFret = tabRow[i];
-
-    if (currentFret === '-') {
-      // Empty column (no note)
-      result.push({
-        fret: '-',
-        sustained: false,
-        isFirstNote: false
-      });
-    }
-    else if (currentFret === '-' || currentFret.startsWith('s')) {
-      // This is a sustained note (marked with '-' or with 's' prefix in legacy format)
-      const fretNumber = currentFret.startsWith('s') ? currentFret.substring(1) : null;
-      result.push({
-        fret: '-', // Display as dash for sustained notes
-        sustained: true,
-        actualFret: fretNumber, // Store the actual fret number for reference (if available)
-        isFirstNote: false
-      });
-    }
-    else {
-      // This is the first note of a new or continuing sequence
-      result.push({
-        fret: currentFret,
-        sustained: false,
-        isFirstNote: true
-      });
-    }
+/**
+ * Render tab using virtual scrolling for performance
+ * @param {GuitarTab} guitarTab
+ * @returns {void}
+ */
+function renderTabVirtual(guitarTab) {
+  // Clean up existing virtual scroller if any
+  if (virtualScroller) {
+    virtualScroller.dispose();
   }
 
-  return result;
+  // Clear display
+  tabDisplay.innerHTML = '';
+  tabDisplay.style.position = 'relative';
+
+  // Initialize virtual scroller
+  virtualScroller = new VirtualScroller(tabDisplay, tabContainer, {
+    columnWidth: columnWidth,
+    lineHeight: 28,
+    stringCount: guitarTab.length,
+    bufferSize: 20,
+    labelWidth: labelWidthPx
+  });
+
+  // Set data and attach
+  virtualScroller.setData(guitarTab);
+  virtualScroller.attach();
+
+  // Update column elements reference for compatibility
+  columnElements = [];
 }
 
 /**
@@ -493,7 +528,7 @@ function updateScroll() {
   }
 
   // Track if we're in MIDI-only mode
-  const midiOnlyMode = midiPlayback && audioPlayer.paused;
+  const midiOnlyMode = midiPlayer && audioPlayer.paused;
 
   // Update the unified playhead from audio if needed
   if (!midiOnlyMode && audioPlayer.duration > 0) {
@@ -512,7 +547,7 @@ function updateScroll() {
     }
 
     // Calculate the exact column index for the current time (including fraction)
-    const exactColumnIndex = timeToColumnIndex(currentTime, sampleRate, HOP_SIZE);
+    const exactColumnIndex = timeToColumnIndex(currentTime);
 
     // Calculate the current integer column index for the background highlighting
     const currentColumnIndex = Math.floor(exactColumnIndex);
@@ -520,16 +555,28 @@ function updateScroll() {
     // Use calculateScrollPosition to determine where to scroll
     const desiredScrollLeft = calculateScrollPosition(exactColumnIndex);
 
-    // Force scroll position if audio is playing OR if in MIDI-only mode
-    // This allows manual scrolling when audio is paused (but not in MIDI-only mode)
-    if (!audioPlayer.paused || midiOnlyMode) {
-      tabContainer.scrollLeft = Math.round(desiredScrollLeft);
+    // Update scroll position during playback
+    // Check if we should auto-scroll
+    const shouldAutoScroll = !audioPlayer.paused || midiOnlyMode;
+
+    if (shouldAutoScroll) {
+      // Temporarily disable smooth scrolling for immediate updates
+      const oldScrollBehavior = tabContainer.style.scrollBehavior;
+      tabContainer.style.scrollBehavior = 'auto';
+
+      // Always update scroll position during playback
+      tabContainer.scrollLeft = desiredScrollLeft;
+
+      // Restore scroll behavior after a frame
+      requestAnimationFrame(() => {
+        tabContainer.style.scrollBehavior = oldScrollBehavior;
+      });
     }
 
     // --- Update Smooth Playhead Position ---
     // Calculate the exact pixel position relative to the start of tabDisplay
-    // Add a small positive offset (10px) to align the playhead with the active column
-    const playheadPixelX = (exactColumnIndex * effectiveColumnWidthCache) + labelWidthPx;
+    const actualColumnWidth = columnWidth || MIN_COLUMN_WIDTH_CALC;
+    const playheadPixelX = (exactColumnIndex * actualColumnWidth) + labelWidthPx;
     // Apply using translateX for smooth animation
     smoothPlayhead.style.transform = `translateX(${playheadPixelX}px)`;
     // Make it visible only when audio is loaded/potentially playing or MIDI is playing
@@ -548,8 +595,6 @@ function updateScroll() {
 
     // Update active column highlights (on integer column)
     updateActiveColumn(currentColumnIndex); // Main highlight
-    //updateActiveColumn(currentColumnIndex - 1, 'prev-active');
-    //updateActiveColumn(currentColumnIndex + 1, 'next-active');
   } else {
     // Hide playhead if no audio/tab loaded and not in MIDI-only mode
     if (smoothPlayhead) smoothPlayhead.style.display = 'none';
@@ -560,231 +605,142 @@ function updateScroll() {
 }
 
 /**
- * @param {number} columnIndex
- * @param {string} [className='active']
+ * @param {number} newColumnIndex
  * @returns {void}
  */
-function updateActiveColumn(newColumnIndex, className = 'active') {
+function updateActiveColumn(newColumnIndex) {
   if (newColumnIndex < 0) return; // Don't process negative indexes
 
-  let lastIndexRef;
-  let setLastIndex; // Function to update the correct last index variable
-
-  // Determine which last index to use/update
-  switch (className) {
-    case 'active':
-      lastIndexRef = lastActiveIndex;
-      setLastIndex = (index) => { lastActiveIndex = index; };
-      break;
-    case 'prev-active':
-      lastIndexRef = lastPrevActiveIndex;
-      setLastIndex = (index) => { lastPrevActiveIndex = index; };
-      break;
-    case 'next-active':
-      lastIndexRef = lastNextActiveIndex;
-      setLastIndex = (index) => { lastNextActiveIndex = index; };
-      break;
-    default:
-      return; // Unknown class
-  }
-
-  // If index hasn't changed, do nothing
-  if (newColumnIndex === lastIndexRef) {
+  // Handle virtual scrolling mode
+  if (virtualScroller) {
+    // Trigger playing animation on columns with notes
+    if (newColumnIndex >= 0 && newColumnIndex < (currentGuitarTab?.[0]?.length || 0)) {
+      const newElements = virtualScroller.getColumnElements(newColumnIndex);
+      newElements.forEach(el => {
+        if (el.classList.contains('note-start') || el.classList.contains('sustained')) {
+          el.classList.add('playing');
+          setTimeout(() => {
+            if (el) el.classList.remove('playing');
+          }, 700);
+        }
+      });
+    }
     return;
   }
 
-  // Remove class from the *previous* column index (if valid)
-  if (lastIndexRef >= 0 && lastIndexRef < (currentGuitarTab?.[0]?.length || 0)) {
-    for (let s = 0; s < 6; s++) {
-      const prevCol = columnElements[s]?.[lastIndexRef];
-      if (prevCol) {
-        prevCol.classList.remove(className);
-        if (className === 'active') {
-          //prevCol.classList.remove('playing'); // Also remove playing state
-          prevCol.style.zIndex = ''; // Reset z-index to default
-        } else if (className === 'prev-active' || className === 'next-active') {
-          prevCol.style.zIndex = ''; // Reset z-index for adjacent columns too
-        }
-      }
-    }
-  }
-
-  // Add class to the *new* column index (if valid)
+  // Standard mode: Trigger playing animation on columns with notes
   if (newColumnIndex >= 0 && newColumnIndex < (currentGuitarTab?.[0]?.length || 0)) {
     for (let s = 0; s < 6; s++) {
       const currentCol = columnElements[s]?.[newColumnIndex];
       if (currentCol) {
-        // currentCol.classList.add(className);
-
-        if (className === 'active') {
-          // Bring active column to front, with higher value for note columns
-          if (currentCol.classList.contains('note-start')) {
-            currentCol.style.zIndex = '11'; // Note columns appear on top
-          } else {
-            currentCol.style.zIndex = '10'; // Standard active columns
-          }
-
-          // Handle 'playing' animation only for the main 'active' class
-          if (currentCol.classList.contains('note-start') || currentCol.classList.contains('sustained')) {
-            // Use a timeout or animationend listener for removal
-            currentCol.classList.add('playing');
-            setTimeout(() => {
-              if (currentCol) currentCol.classList.remove('playing');
-            }, 700); // Match animation duration
-          }
-        } else if (className === 'prev-active' || className === 'next-active') {
-          // Adjacent columns get intermediate z-index
-          currentCol.style.zIndex = '5';
+        // Handle 'playing' animation for notes
+        if (currentCol.classList.contains('note-start') || currentCol.classList.contains('sustained')) {
+          currentCol.classList.add('playing');
+          setTimeout(() => {
+            if (currentCol) currentCol.classList.remove('playing');
+          }, 700); // Match animation duration
         }
       }
     }
   }
-
-  // Update the stored last index
-  setLastIndex(newColumnIndex);
 }
 
 /**
  * Start MIDI playback in sync mode with the audio player
- * @returns {Promise<Object>} The MIDI playback controller
+ * @returns {Promise<void>}
  */
 async function startSyncedMidiPlayback() {
   try {
-    // Set button to active state
     toggleMidiButton.textContent = 'Stop MIDI';
     toggleMidiButton.classList.add('active');
+    const lbl = document.createElement('span');
+    lbl.className = 'sync-label';
+    lbl.textContent = 'Synced with audio';
+    toggleMidiButton.parentNode.appendChild(lbl);
 
-    // Create a label to show sync mode
-    const syncLabel = document.createElement('span');
-    syncLabel.className = 'sync-label';
-    syncLabel.textContent = 'Synced with audio';
-    toggleMidiButton.parentNode.appendChild(syncLabel);
+    const origVol = audioPlayer.volume;
+    audioPlayer.dataset.originalVolume = origVol;
+    audioPlayer.volume = Math.max(0.3, origVol * 0.6);
 
-    // Lower the audio track volume to hear the MIDI better
-    const originalVolume = audioPlayer.volume;
-    audioPlayer.dataset.originalVolume = originalVolume;
-    audioPlayer.volume = Math.max(0.3, originalVolume * 0.6);
+    if (!window.audioContext) window.audioContext = new AudioContext();
+    // Resume audio context if suspended
+    if (window.audioContext.state === 'suspended') {
+      await window.audioContext.resume();
+    }
+    midiPlayer = new MidiPlayer(window.audioContext);
 
-    // Play the tab as MIDI synchronized with the audio player
-    const playback = await playTabAsMidi(currentGuitarTab, HOP_SIZE, sampleRate, audioPlayer);
-
-    // Set up a handler to clean up when audio ends
-    const audioEndHandler = () => {
-      if (midiPlayback) {
-        stopMidiPlayback();
-        // Remove this handler
-        audioPlayer.removeEventListener('ended', audioEndHandler);
-      }
-    };
-
-    audioPlayer.addEventListener('ended', audioEndHandler);
-
-    return playback;
-  } catch (error) {
-    console.error('Error starting synced MIDI playback:', error);
-
+    await midiPlayer.play(currentGuitarTab, HOP_SIZE, sampleRate, audioPlayer, 0, playbackRate);
+  } catch (err) {
+    console.error(err);
     cleanupMidiUI();
-
-    return null;
   }
 }
 
 /**
  * Start MIDI playback in standalone mode
- * @param {number} startPosition - The position to start from (in seconds)
- * @returns {Promise<Object>} The MIDI playback controller
+ * @param {number} startPos - The position to start from (in seconds)
+ * @returns {Promise<void>}
  */
-async function startStandaloneMidiPlayback(startPosition) {
+async function startStandaloneMidiPlayback(startPos) {
   try {
-    // Set button to active state
     toggleMidiButton.textContent = 'Stop MIDI';
     toggleMidiButton.classList.add('active');
+    const lbl = document.createElement('span');
+    lbl.className = 'sync-label';
+    lbl.textContent = 'MIDI only';
+    toggleMidiButton.parentNode.appendChild(lbl);
 
-    // Create a label to show mode
-    const syncLabel = document.createElement('span');
-    syncLabel.className = 'sync-label';
-    syncLabel.textContent = 'MIDI only';
-    toggleMidiButton.parentNode.appendChild(syncLabel);
+    if (!window.audioContext) window.audioContext = new AudioContext();
+    // Resume audio context if suspended
+    if (window.audioContext.state === 'suspended') {
+      await window.audioContext.resume();
+    }
+    midiPlayer = new MidiPlayer(window.audioContext);
 
-    // Play the tab as standalone MIDI without synchronization
-    const playback = await playTabAsMidi(
-      currentGuitarTab,
-      HOP_SIZE,
-      sampleRate,
-      null,
-      startPosition,
-      playbackRate
-    );
+    await midiPlayer.play(currentGuitarTab, HOP_SIZE, sampleRate, null, startPos, playbackRate);
 
-    const autoStopTimeoutId = setTimeout(() => {
-      if (midiPlayback === playback) {
-        stopMidiPlayback();
-      }
-    }, playback.remainingDuration * 1000 + 500);
-
-    // Store the timeout ID in the playback object for cleanup
-    playback.autoStopTimeoutId = autoStopTimeoutId;
-
-    return playback;
-  } catch (error) {
-    console.error('Error starting standalone MIDI playback:', error);
+    const totalDur = currentGuitarTab[0].length * HOP_SIZE / sampleRate;
+    const remaining = (totalDur - startPos) / playbackRate;
+    midiPlayer.autoStopTimeoutId = setTimeout(() => { if (midiPlayer) stopMidiPlayback(); }, remaining * 1000 + 500);
+  } catch (err) {
+    console.error(err);
     cleanupMidiUI();
-    return null;
   }
 }
 
 /**
  * Main function to start MIDI playback in the appropriate mode
+ * @returns {Promise<void>}
  */
 async function startMidiPlayback() {
-  if (midiPlayback) { return; }
-  if (!currentGuitarTab) { return; }
-
-  const currentPlayheadPosition = Math.max(0, playheadState.currentTime);
-  if (!audioPlayer.paused) {
-    midiPlayback = await startSyncedMidiPlayback();
-  } else {
-    midiPlayback = await startStandaloneMidiPlayback(currentPlayheadPosition);
-  }
-
-  if (!midiPlayback) {
-    cleanupMidiUI();
-  }
+  if (midiPlayer || !currentGuitarTab) return;
+  if (!audioPlayer.paused) await startSyncedMidiPlayback();
+  else await startStandaloneMidiPlayback(playheadState.currentTime);
 }
 
+/**
+ * Stop MIDI playback and cleanup
+ * @returns {void}
+ */
 function stopMidiPlayback() {
-  if (midiPlayback == null) { return; }
+  if (!midiPlayer) return;
+  if (midiPlayer.autoStopTimeoutId) clearTimeout(midiPlayer.autoStopTimeoutId);
 
-  // Clear any auto-stop timeout if present
-  if (midiPlayback.autoStopTimeoutId) {
-    clearTimeout(midiPlayback.autoStopTimeoutId);
-    midiPlayback.autoStopTimeoutId = null;
-  }
-
-  // Stop the actual MIDI playback
-  midiPlayback.stop();
-  midiPlayback = null;
-
+  midiPlayer.stop();
+  midiPlayer.dispose();
+  midiPlayer = null;
   cleanupMidiUI();
-
-  // Restore original audio volume if it was changed
   if (audioPlayer.dataset.originalVolume) {
     audioPlayer.volume = parseFloat(audioPlayer.dataset.originalVolume);
     delete audioPlayer.dataset.originalVolume;
   }
-
-  // Mark MIDI as no longer controlling the playhead
   playheadState.updatingFromMidi = false;
-
-  // If audio is loaded, update the audio position to match the unified playhead
-  if (audioPlayer.src && audioPlayer.duration > 0) {
-    // Only set if the difference is significant
-    if (Math.abs(audioPlayer.currentTime - playheadState.currentTime) > 0.1) {
-      audioPlayer.currentTime = playheadState.currentTime;
-    }
-  }
 }
 
+/**
+ * Clean up MIDI UI elements
+ * @returns {void}
+ */
 function cleanupMidiUI() {
   toggleMidiButton.textContent = 'Play MIDI';
   toggleMidiButton.classList.remove('active');
@@ -807,6 +763,12 @@ audioInput.addEventListener('change', async (e) => {
   try {
     // Show loading state
     tabDisplay.innerHTML = '<pre>Loading...</pre>';
+
+    // Clear previous data immediately
+    currentGuitarTab = null;
+    currentNotes = null;
+    currentChords = null;
+    currentConfidenceMap = null;
 
     // Reset the playback rate to default
     audioPlayer.playbackRate = 1.0;
@@ -835,45 +797,30 @@ audioInput.addEventListener('change', async (e) => {
     // Calculate column width after updating max zoom
     columnWidth = calculateColumnWidth();
 
+    // Ensure effective column width is updated
+    getEffectiveColumnWidth();
+
     const audioData = audioBuffer.getChannelData(0);
+    cachedAudioData = new Float32Array(audioData);
 
-    // Create a copy of the audio data to cache
-    cachedAudioData = new Float32Array(audioData.length);
-    cachedAudioData.set(audioData);
+    ensureWorker();
+    // Convert threshold to sensitivity (invert it)
+    const threshold = parseFloat(sensitivitySlider.value);
+    const sensitivity = 1 - threshold;
 
-    // Initialize worker if not already created
-    if (!worker) {
-      worker = new Worker('worker.js', { type: 'module' });
-      worker.onmessage = (e) => {
-        const { guitarTab } = e.data;
-
-        // Store the guitar tab data for MIDI playback
-        if (guitarTab) {
-          currentGuitarTab = guitarTab;
-          toggleMidiButton.disabled = false;
-        }
-
-        renderTab(guitarTab);
-
-        // Initialize scroll animation when tab is first rendered
-        if (animationFrameId === null) {
-          animationFrameId = requestAnimationFrame(updateScroll);
-        }
-      };
-      worker.onerror = (err) => {
-        console.error('Worker error:', err);
-        tabDisplay.innerHTML = '<pre>Error: Processing failed</pre>';
-      };
-    }
-
-    // Send audio data to worker
     worker.postMessage({
-      audioBuffer: audioData.buffer,
+      audioBuffer: cachedAudioData.buffer,
       sampleRate,
       fftSize: FFT_SIZE,
       hopSize: HOP_SIZE,
-      sensitivity: parseFloat(sensitivitySlider.value),
-    }, [audioData.buffer]);
+      sensitivity: sensitivity,
+      guitarConfig: {
+        tuning: [40, 45, 50, 55, 59, 64],
+        maxFret: 24,
+        capo: 0,
+        preferredPosition: [0, 12]
+      }
+    }, [cachedAudioData.buffer]);
 
   } catch (error) {
     console.error('Error processing audio:', error);
@@ -881,55 +828,24 @@ audioInput.addEventListener('change', async (e) => {
   }
 });
 
-// Debounce function to limit reprocessing frequency
-let sensitivityDebounceTimer = null;
-
-// Update sensitivity when slider changes
+let sensTimer = null;
 sensitivitySlider.addEventListener('input', () => {
-  const sensitivity = parseFloat(sensitivitySlider.value);
-  sensitivityValue.textContent = `${(sensitivity * 100).toFixed(1)}%`;
-
-  // Debounce the processing to avoid too frequent updates
-  clearTimeout(sensitivityDebounceTimer);
-  sensitivityDebounceTimer = setTimeout(() => {
-    // If worker exists, update sensitivity directly (no need to reprocess audio data)
-    if (worker) {
-      // Show loading state
-      tabDisplay.innerHTML = '<pre>Processing...</pre>';
-
-      // Store the current MIDI state before reprocessing
-      const wasMidiPlaying = midiPlayback !== null;
-      const audioWasPlaying = !audioPlayer.paused;
-      const currentTime = audioPlayer.currentTime;
-
-      // If MIDI is playing, stop it - we'll restart it after reprocessing
-      if (wasMidiPlaying) {
-        stopMidiPlayback();
-      }
-
-      // With the new GuitarNoteDetector structure, we can update sensitivity without reprocessing audio
-      worker.postMessage({
-        updateSensitivity: true,
-        sensitivity: sensitivity,  // Worker converts this to threshold config values
-      });
-
-      // When the worker responds with new data, the onmessage handler will update currentGuitarTab
-      // Use the existing worker.onmessage handler to restart MIDI if it was playing
-      const originalOnMessage = worker.onmessage;
-      worker.onmessage = async (e) => {
-        // Call the original handler to update the tab
-        originalOnMessage(e);
-
-        // Restore MIDI playback if it was active before
-        if (wasMidiPlaying) {
-          await startMidiPlayback();
-        }
-
-        // Restore worker's original onmessage handler
-        worker.onmessage = originalOnMessage;
-      };
+  const threshold = parseFloat(sensitivitySlider.value);
+  sensitivityValue.textContent = `${(threshold * 100).toFixed(0)}%`;
+  clearTimeout(sensTimer);
+  sensTimer = setTimeout(() => {
+    // Only update if we have a worker and tab data
+    if (!worker || !currentGuitarTab) return;
+    const wasMidi = midiPlayer !== null;
+    // Send inverted value to worker (high threshold = low sensitivity)
+    const sensitivity = 1 - threshold;
+    worker.postMessage({ updateSensitivity: true, sensitivity: sensitivity });
+    // If MIDI was playing, restart it immediately
+    if (wasMidi) {
+      stopMidiPlayback();
+      setTimeout(() => startMidiPlayback(), 10);
     }
-  }, 100); // Reduced debounce time since processing is much faster now
+  }, 100);
 });
 
 // Zoom slider event listener
@@ -946,6 +862,10 @@ zoomSlider.addEventListener('input', () => {
     // Only force reflow and update scroll if width actually changed
     // (The browser handles applying the CSS var change automatically)
     if (columnWidth !== oldWidth) {
+      // Update virtual scroller if active
+      if (virtualScroller) {
+        virtualScroller.updateConfig({ columnWidth: columnWidth });
+      }
       // Force reflow might still be needed before scroll update
       void tabContainer.offsetWidth;
       requestAnimationFrame(updateScroll);
@@ -970,45 +890,32 @@ tempoSlider.addEventListener('input', () => {
   }
 
   // If standalone MIDI is playing, we need to stop and restart it with the new tempo
-  if (midiPlayback && audioPlayer.paused) {
-    const wasPlaying = true;
+  if (midiPlayer && audioPlayer.paused) {
     // Stop current playback
     stopMidiPlayback();
-
     // Restart with new tempo
-    if (wasPlaying) {
-      setTimeout(() => {
-        startMidiPlayback();
-      }, 10);
-    }
+    setTimeout(() => startMidiPlayback(), 10);
   }
   // If MIDI is playing with audio, the audio playback rate change triggers MIDI sync
 });
 
 // Playing state change handlers
-audioPlayer.addEventListener('play', async () => {
-  // Check if MIDI is currently playing
-  const midiWasPlaying = midiPlayback !== null;
-
-  // If MIDI is playing but not in sync mode, we need to restart it in sync mode
-  if (midiWasPlaying) {
-    // First stop the current MIDI playback
+audioPlayer.addEventListener('play', () => {
+  if (midiPlayer) {
     stopMidiPlayback();
-
-    // Now restart MIDI in sync mode with audio using our refactored function
-    midiPlayback = await startSyncedMidiPlayback();
-
-    if (!midiPlayback) {
-      console.error('Failed to resync MIDI with audio');
-    }
+    startSyncedMidiPlayback();
   } else {
-    // Normal case - just update unified playhead to indicate audio is in control
     playheadState.updatingFromMidi = false;
     playheadState.updateFromAudio(audioPlayer);
   }
 });
 
 audioPlayer.addEventListener('pause', () => {
+  // Stop MIDI playback when audio is paused
+  if (midiPlayer) {
+    stopMidiPlayback();
+  }
+
   // Update playhead with final position on pause
   if (!playheadState.updatingFromMidi) {
     playheadState.updateFromAudio(audioPlayer);
@@ -1023,7 +930,7 @@ audioPlayer.addEventListener('seeking', () => {
     }
 
     const currentTime = playheadState.currentTime;
-    const exactColumnIndex = timeToColumnIndex(currentTime, sampleRate, HOP_SIZE);
+    const exactColumnIndex = timeToColumnIndex(currentTime);
     const desiredScrollLeft = calculateScrollPosition(exactColumnIndex);
 
     // Force scroll position update
@@ -1065,6 +972,7 @@ function calculateMaxZoomLevel() {
 
 /**
  * Update zoom slider's maximum value based on viewport size
+ * @returns {void}
  */
 function updateZoomSliderMax() {
   const maxZoom = calculateMaxZoomLevel();
@@ -1102,17 +1010,59 @@ window.addEventListener('resize', () => {
 });
 
 // Toggle MIDI button event listener
-toggleMidiButton.addEventListener('click', async () => {
-  if (midiPlayback) {
-    stopMidiPlayback();
-  }
-  else {
-    await startMidiPlayback();
-  }
+toggleMidiButton.addEventListener('click', () => {
+  if (midiPlayer) stopMidiPlayback();
+  else startMidiPlayback();
 });
 
 // When starting the application, disable the MIDI button until data is available
 toggleMidiButton.disabled = true;
+exportMidiButton.disabled = true;
+
+// Export MIDI button event listener
+exportMidiButton.addEventListener('click', () => {
+  if (!currentGuitarTab) return;
+
+  try {
+    let blob;
+
+    // Use currentNotes if available (respects sensitivity), otherwise use guitar tab
+    if (currentNotes && currentNotes.length > 0) {
+      // Export using the current detected notes
+      const midiData = midiExporter.exportToMidi(currentNotes, sampleRate, HOP_SIZE);
+      blob = new Blob([midiData], { type: 'audio/midi' });
+    } else {
+      // Fall back to guitar tab export
+      const midiData = midiExporter.exportGuitarTabToMidi(
+        currentGuitarTab,
+        currentConfidenceMap,
+        sampleRate,
+        HOP_SIZE
+      );
+      blob = new Blob([midiData], { type: 'audio/midi' });
+    }
+
+    // Create download link
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'guitar-tab-export.mid';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+
+    // Visual feedback
+    exportMidiButton.textContent = 'Exported!';
+    setTimeout(() => {
+      exportMidiButton.textContent = 'Export MIDI';
+    }, 2000);
+
+  } catch (error) {
+    console.error('MIDI export error:', error);
+    alert('Failed to export MIDI: ' + error.message);
+  }
+});
 
 // Handle theme toggle
 const themeToggle = document.getElementById('themeToggle');
@@ -1130,42 +1080,29 @@ themeToggle.addEventListener('click', () => {
   localStorage.setItem('theme', isDarkMode ? 'dark' : 'light');
 });
 
-// Use more modern beforeunload or visibilitychange instead of unload
-window.addEventListener('beforeunload', () => {
-  // Clean up resources before page unload
-  cleanupResources();
-});
+window.addEventListener('beforeunload', cleanup);
 
 /**
+ * Clean up resources before page unload
  * @returns {void}
  */
-function cleanupResources() {
-  // Stop any active MIDI playback
-  if (midiPlayback) {
-    stopMidiPlayback();
+function cleanup() {
+  if (midiPlayer) stopMidiPlayback();
+  if (animationFrameId) cancelAnimationFrame(animationFrameId);
+  if (worker) worker.terminate();
+  if (virtualScroller) {
+    virtualScroller.dispose();
+    virtualScroller = null;
   }
-
-  // Cancel any active animation frame
-  if (animationFrameId) {
-    cancelAnimationFrame(animationFrameId);
-    animationFrameId = null;
-  }
-
-  // Terminate worker
-  if (worker) {
-    worker.terminate();
-    worker = null;
+  if (unifiedClock) {
+    unifiedClock.dispose();
+    unifiedClock = null;
   }
 }
 
-// Also clean up when tab becomes hidden (better for mobile/modern browsers)
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'hidden') {
-    // Stop MIDI playback when tab is hidden
-    if (midiPlayback) {
-      stopMidiPlayback();
-    }
-
+    if (midiPlayer) stopMidiPlayback();
     audioPlayer.pause();
   }
 });

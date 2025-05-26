@@ -1,654 +1,806 @@
+// Guitar string tuning in MIDI notes
+const STANDARD_TUNING = [40, 45, 50, 55, 59, 64]; // E2, A2, D3, G3, B3, E4
+
+// Note articulation types
+const ARTICULATION = {
+  NORMAL: 'normal',
+  BEND_UP: 'bendUp',
+  BEND_DOWN: 'bendDown',
+  SLIDE_UP: 'slideUp',
+  SLIDE_DOWN: 'slideDown',
+  HAMMER_ON: 'hammerOn',
+  PULL_OFF: 'pullOff',
+  VIBRATO: 'vibrato',
+  PALM_MUTE: 'palmMute',
+  HARMONIC: 'harmonic'
+};
+
 /**
- * Enhanced MIDI playback module for guitar tablature using Web Audio API with audio synchronization.
- * This implementation creates a rich, guitar-like tone without external libraries
- * and synchronizes MIDI playback with audio playback position.
+ * Guitar synthesis engine using Web Audio API
  */
+class GuitarSynthesizer {
+  constructor(audioContext) {
+    this.context = audioContext;
+    this.strings = [];
+    this.masterGain = this.context.createGain();
+    this.masterGain.gain.value = 1.0;
 
-// Base MIDI notes for each string in standard tuning (E2, A2, D3, G3, B3, E4)
-const stringMidi = [40, 45, 50, 55, 59, 64];
+    // Create effects chain
+    this.compressor = this.createCompressor();
+    this.reverb = this.createReverb();
+    this.cabinet = this.createCabinetSimulator();
 
-/**
- * Creates a short impulse response for a simple reverb effect
- * @param {AudioContext} context - The audio context
- * @param {number} duration - Duration of impulse in seconds
- * @param {number} decay - Decay rate
- * @returns {AudioBuffer} Impulse response buffer
- */
-function createReverbImpulse(context, duration = 1.5, decay = 2.0) {
-  const sampleRate = context.sampleRate;
-  const length = sampleRate * duration;
-  const impulse = context.createBuffer(2, length, sampleRate);
-  const leftChannel = impulse.getChannelData(0);
-  const rightChannel = impulse.getChannelData(1);
+    // Connect effects chain
+    this.masterGain.connect(this.compressor);
+    this.compressor.connect(this.cabinet);
+    this.cabinet.connect(this.context.destination);
 
-  for (let i = 0; i < length; i++) {
-    // Decreasing amplitude over time
-    const amplitude = Math.pow(1 - i / length, decay);
+    // Reverb send
+    this.reverbSend = this.context.createGain();
+    this.reverbSend.gain.value = 0.2;
+    this.masterGain.connect(this.reverbSend);
+    this.reverbSend.connect(this.reverb);
+    this.reverb.connect(this.context.destination);
 
-    // Random value between -1 and 1, multiplied by decreasing amplitude
-    const sample = (Math.random() * 2 - 1) * amplitude;
-
-    leftChannel[i] = sample;
-    // Slightly different reverb in right channel for stereo effect
-    rightChannel[i] = (Math.random() * 2 - 1) * amplitude;
+    // Initialize string simulators
+    this.initializeStrings();
   }
 
-  return impulse;
+  initializeStrings() {
+    for (let i = 0; i < 6; i++) {
+      this.strings[i] = new GuitarString(this.context, i, STANDARD_TUNING[i]);
+    }
+  }
+
+  createCompressor() {
+    const comp = this.context.createDynamicsCompressor();
+    comp.threshold.value = -24;
+    comp.knee.value = 30;
+    comp.ratio.value = 4;
+    comp.attack.value = 0.003;
+    comp.release.value = 0.25;
+    return comp;
+  }
+
+  createReverb() {
+    const convolver = this.context.createConvolver();
+    const length = this.context.sampleRate * 2;
+    const impulse = this.context.createBuffer(2, length, this.context.sampleRate);
+
+    for (let channel = 0; channel < 2; channel++) {
+      const channelData = impulse.getChannelData(channel);
+      for (let i = 0; i < length; i++) {
+        const decay = Math.pow(1 - i / length, 2);
+        channelData[i] = (Math.random() * 2 - 1) * decay;
+      }
+    }
+
+    convolver.buffer = impulse;
+    return convolver;
+  }
+
+  createCabinetSimulator() {
+    // Simple cabinet simulation using filters
+    const lowShelf = this.context.createBiquadFilter();
+    lowShelf.type = 'lowshelf';
+    lowShelf.frequency.value = 500;
+    lowShelf.gain.value = -3;
+
+    const highShelf = this.context.createBiquadFilter();
+    highShelf.type = 'highshelf';
+    highShelf.frequency.value = 3000;
+    highShelf.gain.value = -6;
+
+    const mid = this.context.createBiquadFilter();
+    mid.type = 'peaking';
+    mid.frequency.value = 1500;
+    mid.Q.value = 0.7;
+    mid.gain.value = 2;
+
+    lowShelf.connect(highShelf);
+    highShelf.connect(mid);
+
+    return lowShelf;
+  }
+
+  playNote(stringIndex, fret, startTime, duration, articulation = ARTICULATION.NORMAL, velocity = 0.8) {
+    if (stringIndex < 0 || stringIndex >= 6) return null;
+
+    const string = this.strings[stringIndex];
+    const note = string.pluck(fret, startTime, duration, velocity, articulation);
+
+    // Connect to master output
+    note.output.connect(this.masterGain);
+
+    return note;
+  }
+
+  stopAllNotes() {
+    this.strings.forEach(string => string.stopAllNotes());
+  }
+
+  dispose() {
+    this.stopAllNotes();
+    this.masterGain.disconnect();
+    this.compressor.disconnect();
+    this.reverb.disconnect();
+    this.cabinet.disconnect();
+    this.reverbSend.disconnect();
+  }
 }
 
 /**
- * Creates reverb effect node
- * @param {AudioContext} context - The audio context
- * @returns {ConvolverNode} Configured reverb node
+ * Karplus-Strong string synthesis
  */
-function createReverb(context) {
-  const convolver = context.createConvolver();
-  convolver.buffer = createReverbImpulse(context, 1.5, 2.0);
-  return convolver;
+class KarplusStrongString {
+  constructor(context, frequency, duration = 2.0) {
+    this.context = context;
+    this.frequency = frequency;
+    this.duration = duration;
+
+    // Calculate delay line length
+    this.sampleRate = context.sampleRate;
+    this.delayLength = Math.round(this.sampleRate / frequency);
+
+    // Create nodes
+    this.noise = context.createBufferSource();
+    this.filter = context.createBiquadFilter();
+    this.delay = context.createDelay(1.0);
+    this.feedback = context.createGain();
+    this.output = context.createGain();
+
+    // Configure filter (lowpass for string damping)
+    this.filter.type = 'lowpass';
+    this.filter.frequency.value = 2000;
+    this.filter.Q.value = 0.5;
+
+    // Configure delay
+    this.delay.delayTime.value = this.delayLength / this.sampleRate;
+
+    // Configure feedback (controls decay time)
+    // Clamp feedback to prevent runaway feedback
+    const decayFactor = Math.pow(0.001, 1 / (duration * frequency));
+    this.feedback.gain.value = Math.min(0.98, decayFactor);
+
+    // Create initial noise burst
+    const noiseBuffer = this.createNoiseBuffer();
+    this.noise.buffer = noiseBuffer;
+
+    // Connect nodes
+    this.noise.connect(this.output);
+    this.noise.connect(this.delay);
+    this.delay.connect(this.filter);
+    this.filter.connect(this.feedback);
+    this.feedback.connect(this.delay);
+    this.feedback.connect(this.output);
+  }
+
+  createNoiseBuffer() {
+    // Create short burst of filtered noise
+    const length = Math.max(64, this.delayLength);
+    const buffer = this.context.createBuffer(1, length, this.sampleRate);
+    const data = buffer.getChannelData(0);
+
+    // Fill with filtered white noise
+    for (let i = 0; i < length; i++) {
+      data[i] = (Math.random() * 2 - 1) * 0.5;
+    }
+
+    // Apply simple lowpass filter to shape pluck
+    for (let i = 1; i < length; i++) {
+      data[i] = data[i] * 0.5 + data[i-1] * 0.5;
+    }
+
+    return buffer;
+  }
+
+  pluck(startTime, velocity = 1.0, pluckPosition = 0.9) {
+    // Adjust filter based on pluck position (brightness)
+    this.filter.frequency.setValueAtTime(
+      2000 + 3000 * pluckPosition,
+      startTime
+    );
+
+    // Start noise burst
+    this.noise.start(startTime);
+    this.noise.stop(startTime + 0.01); // Very short burst
+
+    // Apply velocity
+    this.output.gain.setValueAtTime(velocity, startTime);
+
+    return this.output;
+  }
+
+  stop(time) {
+    // Quickly damp the string
+    this.feedback.gain.exponentialRampToValueAtTime(0.001, time + 0.1);
+
+    // Schedule cleanup
+    setTimeout(() => {
+      this.noise.disconnect();
+      this.filter.disconnect();
+      this.delay.disconnect();
+      this.feedback.disconnect();
+    }, (time - this.context.currentTime + 0.5) * 1000);
+  }
 }
 
 /**
- * Plays the guitar tab as MIDI notes using Web Audio API with enhanced tone.
- * Synchronizes with the audio player position.
- * @param {Array<Array<string>>} guitarTab - 2D array representing the guitar tab.
- * @param {number} hopSize - Hop size in samples used in audio analysis.
- * @param {number} sampleRate - Sample rate of the audio in Hz.
- * @param {HTMLAudioElement} audioPlayer - Audio element to sync with
- * @param {number} startTime - Starting time position in seconds (for standalone mode)
- * @param {number} playbackRate - Playback rate multiplier (default: 1.0)
- * @returns {Promise<{duration: number, stop: Function}>} - Object containing playback duration and stop function
+ * Individual guitar string simulator
  */
-export async function playTabAsMidi(guitarTab, hopSize, sampleRate, audioPlayer = null, startTime = 0, playbackRate = 1.0) {
-  // Create a new AudioContext for audio playback
-  const audioContext = new AudioContext();
-
-  // Ensure AudioContext is running (requires user gesture in browsers)
-  if (audioContext.state === 'suspended') {
-    await audioContext.resume();
+class GuitarString {
+  constructor(context, index, openNote) {
+    this.context = context;
+    this.index = index;
+    this.openNote = openNote;
+    this.activeNotes = [];
+    this.useKarplusStrong = false; // Feature flag - disabled due to feedback issues
   }
 
-  // Create effect chain
-  const masterGain = audioContext.createGain();
-  masterGain.gain.value = 0.7; // Increased volume to be heard better alongside song
+  pluck(fret, startTime, duration, velocity, articulation) {
+    const midiNote = this.openNote + fret;
+    const frequency = 440 * Math.pow(2, (midiNote - 69) / 12);
 
-  // Create a compressor to even out dynamics
-  const compressor = audioContext.createDynamicsCompressor();
-  compressor.threshold.value = -24;
-  compressor.knee.value = 10;
-  compressor.ratio.value = 4;
-  compressor.attack.value = 0.005;
-  compressor.release.value = 0.25;
+    // Use Karplus-Strong for normal notes if enabled
+    if (this.useKarplusStrong && articulation === ARTICULATION.NORMAL) {
+      return this.createKarplusStrongNote(frequency, startTime, duration, velocity);
+    }
 
-  // Create a reverb effect for spatial depth
-  const reverb = createReverb(audioContext);
-  const reverbGain = audioContext.createGain();
-  reverbGain.gain.value = 0.15; // Subtle reverb mix
+    // Create note based on articulation
+    let note;
+    switch (articulation) {
+      case ARTICULATION.BEND_UP:
+        note = this.createBendNote(frequency, startTime, duration, velocity, 1);
+        break;
+      case ARTICULATION.BEND_DOWN:
+        note = this.createBendNote(frequency, startTime, duration, velocity, -1);
+        break;
+      case ARTICULATION.SLIDE_UP:
+        note = this.createSlideNote(frequency, startTime, duration, velocity, 1);
+        break;
+      case ARTICULATION.SLIDE_DOWN:
+        note = this.createSlideNote(frequency, startTime, duration, velocity, -1);
+        break;
+      case ARTICULATION.VIBRATO:
+        note = this.createVibratoNote(frequency, startTime, duration, velocity);
+        break;
+      case ARTICULATION.PALM_MUTE:
+        note = this.createPalmMuteNote(frequency, startTime, duration, velocity);
+        break;
+      case ARTICULATION.HARMONIC:
+        note = this.createHarmonicNote(frequency, startTime, duration, velocity);
+        break;
+      default:
+        note = this.createNormalNote(frequency, startTime, duration, velocity);
+    }
 
-  // Connect the effect chain
-  masterGain.connect(compressor);
-  masterGain.connect(reverbGain); // Dry path to reverb
-  reverbGain.connect(reverb);
-  reverb.connect(compressor); // Reverb path to compressor
-  compressor.connect(audioContext.destination);
+    this.activeNotes.push(note);
 
-  // Calculate duration of each time step in seconds
-  const timePerColumn = hopSize / sampleRate;
-  const numColumns = guitarTab[0].length;
+    // Schedule cleanup
+    setTimeout(() => {
+      const index = this.activeNotes.indexOf(note);
+      if (index > -1) {
+        this.activeNotes.splice(index, 1);
+      }
+    }, (duration + 2) * 1000);
 
-  const activeNodes = [];
-  const scheduledColumns = new Set();
-  let shouldStop = false;
+    return note;
+  }
 
-  // Animation frame ID for the scheduler
-  let schedulerFrameId = null;
+  createKarplusStrongNote(frequency, startTime, duration, velocity) {
+    const note = new GuitarNote(this.context);
 
-  // Determine if we're in sync mode (with audio player) or standalone mode
-  const syncMode = audioPlayer !== null;
+    // Create Karplus-Strong string
+    const string = new KarplusStrongString(this.context, frequency, duration);
+    const output = string.pluck(startTime, velocity);
 
-  // Track last playback rate to detect changes
-  let lastPlaybackRate = syncMode ? audioPlayer.playbackRate : 1.0;
+    // Add some body resonance
+    const bodyFilter = this.context.createBiquadFilter();
+    bodyFilter.type = 'peaking';
+    bodyFilter.frequency.value = 100;
+    bodyFilter.Q.value = 2;
+    bodyFilter.gain.value = 3;
 
-  // Reference time for sync mode
-  let startContextTime = 0;
-  let startAudioTime = 0;
-  let lastCurrentTime = 0;
-  let lastLoggedTime = 0;
+    output.connect(bodyFilter);
 
-  /**
-   * Creates a complete guitar tone with multiple oscillators and processing
-   * @param {number} frequency - Base frequency in Hz
-   * @param {number} startTime - Start time in seconds
-   * @param {number} duration - Duration in seconds
-   * @param {number} stringIndex - Which string (0-5) for panning
-   * @param {number} velocity - Note velocity/loudness (0-1)
-   * @returns {Object} Object containing the oscillators and control nodes
-   */
-  function createGuitarTone(frequency, startTime, duration, stringIndex, velocity = 0.8) {
-    // Only create tones if not stopped
-    if (shouldStop) return null;
+    note.string = string;
+    note.output = bodyFilter;
 
-    // Primary oscillator (sawtooth) for the main tone
-    const osc1 = audioContext.createOscillator();
-    osc1.type = 'sawtooth';
-    osc1.frequency.setValueAtTime(frequency, startTime);
+    return note;
+  }
 
-    // Secondary oscillator (square) for added harmonic richness
-    const osc2 = audioContext.createOscillator();
-    osc2.type = 'square';
-    osc2.frequency.setValueAtTime(frequency * 1.005, startTime); // Slightly detuned
+  createNormalNote(frequency, startTime, duration, velocity) {
+    const note = new GuitarNote(this.context);
 
-    // Tertiary oscillator (triangle) for a smooth bottom end
-    const osc3 = audioContext.createOscillator();
-    osc3.type = 'triangle';
-    osc3.frequency.setValueAtTime(frequency * 0.5, startTime); // One octave down
+    // Create oscillators
+    const fundamental = this.context.createOscillator();
+    fundamental.type = 'sawtooth';
+    fundamental.frequency.setValueAtTime(frequency, startTime);
 
-    // Oscillator gain balance
-    const gainOsc1 = audioContext.createGain();
-    gainOsc1.gain.value = 0.5 * velocity;
+    const octave = this.context.createOscillator();
+    octave.type = 'square';
+    octave.frequency.setValueAtTime(frequency * 2, startTime);
 
-    const gainOsc2 = audioContext.createGain();
-    gainOsc2.gain.value = 0.15 * velocity;
+    // Create envelope
+    const envelope = this.context.createGain();
+    envelope.gain.setValueAtTime(0, startTime);
+    envelope.gain.linearRampToValueAtTime(velocity, startTime + 0.002);
+    envelope.gain.exponentialRampToValueAtTime(velocity * 0.3, startTime + 0.05);
+    envelope.gain.exponentialRampToValueAtTime(0.001, startTime + duration);
 
-    const gainOsc3 = audioContext.createGain();
-    gainOsc3.gain.value = 0.1 * velocity;
-
-    // Main gain node for ADSR envelope
-    const noteGain = audioContext.createGain();
-    noteGain.gain.setValueAtTime(0, startTime);
-
-    // Scale ADSR timings with duration
-    const attackTime = Math.min(0.005, duration / 4);
-    const decayTime = Math.min(0.08, duration / 2);
-    const releaseTime = Math.min(0.1, duration / 2);
-
-    // Attack: Quick rise (pluck simulation)
-    noteGain.gain.linearRampToValueAtTime(velocity, startTime + attackTime);
-
-    // Decay: Fast drop to sustain level
-    noteGain.gain.linearRampToValueAtTime(0.3 * velocity, startTime + decayTime);
-
-    // Sustain: Steady level
-    noteGain.gain.setValueAtTime(0.3 * velocity, startTime + duration - releaseTime);
-
-    // Release: Smooth fade out
-    noteGain.gain.linearRampToValueAtTime(0, startTime + duration + releaseTime);
-
-    // Filter for warmth, removing harsh high frequencies
-    const filter = audioContext.createBiquadFilter();
+    // Create filter
+    const filter = this.context.createBiquadFilter();
     filter.type = 'lowpass';
-    filter.frequency.setValueAtTime(5000, startTime); // Higher cutoff for clarity
-    filter.frequency.linearRampToValueAtTime(2000, startTime + 0.1); // Roll off high frequencies
-    filter.Q.value = 1; // Moderate resonance
+    filter.frequency.setValueAtTime(2000 + frequency, startTime);
+    filter.frequency.exponentialRampToValueAtTime(1000, startTime + duration);
+    filter.Q.value = 2;
 
-    // Stereo panning to position strings across the stereo field
-    const panner = audioContext.createStereoPanner();
-    // Spread strings from left (-0.8) to right (0.8)
-    panner.pan.setValueAtTime((stringIndex - 2.5) / 3, startTime);
+    // Oscillator gains
+    const fundGain = this.context.createGain();
+    fundGain.gain.value = 0.7;
 
-    // Connect oscillators to their individual gain nodes
-    osc1.connect(gainOsc1);
-    osc2.connect(gainOsc2);
-    osc3.connect(gainOsc3);
+    const octaveGain = this.context.createGain();
+    octaveGain.gain.value = 0.2;
 
-    // Connect the oscillator gains to the filter
-    gainOsc1.connect(filter);
-    gainOsc2.connect(filter);
-    gainOsc3.connect(filter);
+    // Connect
+    fundamental.connect(fundGain);
+    octave.connect(octaveGain);
+    fundGain.connect(filter);
+    octaveGain.connect(filter);
+    filter.connect(envelope);
 
-    // Connect the filter through the envelope to the panner
-    filter.connect(noteGain);
-    noteGain.connect(panner);
+    // Start and stop
+    fundamental.start(startTime);
+    octave.start(startTime);
+    fundamental.stop(startTime + duration + 0.5);
+    octave.stop(startTime + duration + 0.5);
 
-    // Connect panner to master gain
-    panner.connect(masterGain);
+    note.oscillators = [fundamental, octave];
+    note.output = envelope;
 
-    // Start all oscillators
-    osc1.start(startTime);
-    osc2.start(startTime);
-    osc3.start(startTime);
+    return note;
+  }
 
-    // Stop time with release tail
-    const stopTime = startTime + duration + releaseTime;
+  createBendNote(frequency, startTime, duration, velocity, direction) {
+    const note = this.createNormalNote(frequency, startTime, duration, velocity);
 
-    // Schedule stops
-    osc1.stop(stopTime);
-    osc2.stop(stopTime);
-    osc3.stop(stopTime);
+    // Add pitch bend
+    const bendAmount = direction > 0 ? 200 : -200; // cents
+    const targetFreq = frequency * Math.pow(2, bendAmount / 1200);
 
-    // Store all nodes for later cleanup
-    const nodes = [osc1, osc2, osc3, gainOsc1, gainOsc2, gainOsc3, noteGain, filter, panner];
-    activeNodes.push(...nodes);
+    note.oscillators.forEach((osc, i) => {
+      const baseFreq = i === 0 ? frequency : frequency * 2;
+      const targetOscFreq = i === 0 ? targetFreq : targetFreq * 2;
+
+      osc.frequency.setValueAtTime(baseFreq, startTime);
+      osc.frequency.exponentialRampToValueAtTime(targetOscFreq, startTime + duration * 0.3);
+      osc.frequency.setValueAtTime(targetOscFreq, startTime + duration * 0.7);
+      osc.frequency.exponentialRampToValueAtTime(baseFreq, startTime + duration);
+    });
+
+    return note;
+  }
+
+  createSlideNote(frequency, startTime, duration, velocity, direction) {
+    const note = this.createNormalNote(frequency, startTime, duration, velocity);
+
+    // Slide from/to adjacent fret
+    const slideAmount = direction > 0 ? -100 : 100; // cents
+    const startFreq = frequency * Math.pow(2, slideAmount / 1200);
+
+    note.oscillators.forEach((osc, i) => {
+      const baseFreq = i === 0 ? frequency : frequency * 2;
+      const slideStartFreq = i === 0 ? startFreq : startFreq * 2;
+
+      osc.frequency.setValueAtTime(slideStartFreq, startTime);
+      osc.frequency.exponentialRampToValueAtTime(baseFreq, startTime + duration * 0.2);
+    });
+
+    return note;
+  }
+
+  createVibratoNote(frequency, startTime, duration, velocity) {
+    const note = this.createNormalNote(frequency, startTime, duration, velocity);
+
+    // Add vibrato using LFO
+    const lfo = this.context.createOscillator();
+    lfo.frequency.value = 5; // 5 Hz vibrato
+
+    const lfoGain = this.context.createGain();
+    lfoGain.gain.value = frequency * 0.02; // 2% pitch variation
+
+    lfo.connect(lfoGain);
+
+    note.oscillators.forEach(osc => {
+      lfoGain.connect(osc.frequency);
+    });
+
+    lfo.start(startTime + 0.1); // Delay vibrato slightly
+    lfo.stop(startTime + duration + 0.5);
+
+    return note;
+  }
+
+  createPalmMuteNote(frequency, startTime, duration, velocity) {
+    if (this.useKarplusStrong) {
+      const note = new GuitarNote(this.context);
+
+      // Create heavily damped Karplus-Strong string
+      const string = new KarplusStrongString(this.context, frequency, duration * 0.3);
+
+      // Override damping for palm mute effect
+      string.feedback.gain.value *= 0.5; // More damping
+      string.filter.frequency.value = 500; // Lower cutoff
+
+      const output = string.pluck(startTime, velocity * 0.7, 0.3); // Pluck near bridge
+
+      note.string = string;
+      note.output = output;
+
+      return note;
+    }
+
+    const note = this.createNormalNote(frequency, startTime, duration * 0.3, velocity * 0.7);
+
+    // Heavily filtered for muted sound
+    const muteFilter = this.context.createBiquadFilter();
+    muteFilter.type = 'lowpass';
+    muteFilter.frequency.value = 500;
+    muteFilter.Q.value = 5;
+
+    note.output.connect(muteFilter);
+    note.output = muteFilter;
+
+    return note;
+  }
+
+  createHarmonicNote(frequency, startTime, duration, velocity) {
+    const note = new GuitarNote(this.context);
+
+    // Natural harmonics at 12th, 7th, and 5th frets
+    const harmonic = this.context.createOscillator();
+    harmonic.type = 'sine';
+    harmonic.frequency.setValueAtTime(frequency * 2, startTime); // Octave harmonic
+
+    const envelope = this.context.createGain();
+    envelope.gain.setValueAtTime(0, startTime);
+    envelope.gain.linearRampToValueAtTime(velocity * 0.5, startTime + 0.001);
+    envelope.gain.exponentialRampToValueAtTime(0.001, startTime + duration * 1.5);
+
+    harmonic.connect(envelope);
+    harmonic.start(startTime);
+    harmonic.stop(startTime + duration * 1.5);
+
+    note.oscillators = [harmonic];
+    note.output = envelope;
+
+    return note;
+  }
+
+  stopAllNotes() {
+    this.activeNotes.forEach(note => {
+      if (note.string && note.string instanceof KarplusStrongString) {
+        // Stop Karplus-Strong string
+        note.string.stop(this.context.currentTime);
+      } else if (note.oscillators) {
+        // Stop regular oscillators
+        note.oscillators.forEach(osc => {
+          try {
+            osc.stop();
+          } catch (e) {
+            // Already stopped
+          }
+        });
+      }
+    });
+    this.activeNotes = [];
+  }
+}
+
+/**
+ * Guitar note container
+ */
+class GuitarNote {
+  constructor(context) {
+    this.context = context;
+    this.oscillators = [];
+    this.output = null;
+    this.string = null; // For Karplus-Strong strings
+  }
+}
+
+/**
+ * Enhanced MIDI Player for guitar tablature
+ */
+export class MidiPlayer {
+  constructor(audioContext) {
+    this.context = audioContext;
+    this.synthesizer = new GuitarSynthesizer(this.context);
+    this.scheduledNotes = [];
+    this.isPlaying = false;
+    this.startTime = 0;
+    this.currentTime = 0;
+    this.playbackRate = 1.0;
+    this.syncSource = null;
+    this.animationFrame = null;
+
+    // For unified clock integration
+    this.useUnifiedClock = true;
+    this.clockOffset = 0;
+  }
+
+  /**
+   * Get current time for unified clock
+   */
+  getCurrentTime() {
+    return this.currentTime;
+  }
+
+  /**
+   * Seek to time (called by unified clock)
+   */
+  seek(time) {
+    this.currentTime = time;
+    if (this.isPlaying) {
+      this.clearScheduledNotes();
+    }
+  }
+
+  /**
+   * Play guitar tablature
+   * @param {Array<Array<string>>} guitarTab - 6xN array of fret values
+   * @param {number} hopSize - Samples per column
+   * @param {number} sampleRate - Sample rate
+   * @param {HTMLAudioElement} audioElement - Optional audio element for sync
+   * @param {number} startPosition - Start position in seconds
+   * @param {number} playbackRate - Playback speed multiplier
+   */
+  async play(guitarTab, hopSize, sampleRate, audioElement = null, startPosition = 0, playbackRate = 1.0) {
+    if (this.isPlaying) {
+      this.stop();
+    }
+
+    // Resume context if needed
+    if (this.context.state === 'suspended') {
+      await this.context.resume();
+    }
+
+    this.isPlaying = true;
+    this.playbackRate = playbackRate;
+    this.syncSource = audioElement;
+    this.startTime = this.context.currentTime;
+    this.currentTime = startPosition;
+
+    const timePerColumn = hopSize / sampleRate;
+    const duration = guitarTab[0].length * timePerColumn;
+
+    if (audioElement) {
+      // Synchronized playback - start immediately
+      this.scheduleWithSync(guitarTab, timePerColumn, audioElement);
+    } else {
+      // Standalone playback
+      this.scheduleStandalone(guitarTab, timePerColumn, startPosition);
+    }
 
     return {
-      oscillators: [osc1, osc2, osc3],
-      gains: [gainOsc1, gainOsc2, gainOsc3, noteGain],
-      filter,
-      panner,
       duration: duration,
-      stopTime: stopTime
+      stop: () => this.stop(),
+      seek: (time) => this.seek(time),
+      setPlaybackRate: (rate) => this.setPlaybackRate(rate)
     };
   }
 
-  /**
-   * Converts MIDI note number to frequency in Hz
-   * @param {number} midi - MIDI note number
-   * @returns {number} Frequency in Hz
-   */
-  function midiToFrequency(midi) {
-    return 440 * Math.pow(2, (midi - 69) / 12);
-  }
+  scheduleWithSync(guitarTab, timePerColumn, audioElement) {
+    const scheduleAhead = 1.0; // Schedule 1 second ahead for better reliability
+    let lastScheduledTime = -1;
+    const syncOffset = -0.05; // Offset in seconds to compensate for processing delay (negative = earlier)
 
-  /**
-   * Schedule notes for a specific column in the tab
-   * @param {number} col - Column index to schedule
-   * @param {number} contextTime - Audio context time to start from
-   * @param {number} playbackSpeed - Playback speed multiplier
-   */
-  function scheduleColumn(col, contextTime, playbackSpeed = 1.0) {
-    if (col < 0 || col >= numColumns || scheduledColumns.has(col) || shouldStop) {
-      return;
-    }
+    const scheduleNotes = () => {
+      if (!this.isPlaying) return;
 
-    const startTime = contextTime;
-    // Adjust note duration inversely to playback speed (faster = shorter notes)
-    // Enforce a minimum duration to ensure all notes are audible
-    const noteDuration = Math.max(0.1, (timePerColumn * 1.2) / playbackSpeed);
+      const currentAudioTime = audioElement.currentTime;
+      const currentContextTime = this.context.currentTime;
+      const scheduleUntil = currentAudioTime + scheduleAhead;
 
-    // Check each string at this time step
-    for (let s = 0; s < 6; s++) {
-      const fretValue = guitarTab[s][col];
-
-      if (fretValue !== '-') {
-        // Handle sustained note markers (starting with 's')
-        let fret;
-        let isStartingNote = true;
-
-        if (fretValue.startsWith('s')) {
-          // This is a sustained note - extract the fret number after the 's'
-          fret = fretValue.substring(1);
-          isStartingNote = false;
-        } else {
-          // This is the start of a note
-          fret = fretValue;
-        }
-
-        // Calculate MIDI note: base note of string plus fret number
-        const baseMidi = stringMidi[s];
-        const midiNote = baseMidi + parseInt(fret);
-        const frequency = midiToFrequency(midiNote);
-
-        // For sustained notes, we'll use a lower velocity to make them softer
-        const velocity = isStartingNote ? 0.8 : 0.6;
-
-        // Create a rich guitar-like tone for this note - but only for starting notes
-        if (isStartingNote) {
-          // Calculate the total duration by looking ahead to count sustained markers
-          let totalDuration = noteDuration;
-          let sustainCount = 0;
-
-          // Look ahead to count how many sustained markers follow this note
-          for (let nextCol = col + 1; nextCol < numColumns; nextCol++) {
-            const nextValue = guitarTab[s][nextCol];
-            if (nextValue === `s${fret}`) {
-              sustainCount++;
-            } else {
-              break; // Stop at the first non-matching value
-            }
-          }
-
-          // Extend the note duration based on sustained columns
-          if (sustainCount > 0) {
-            totalDuration = noteDuration * (sustainCount + 1);
-          }
-
-          createGuitarTone(frequency, startTime, totalDuration, s, velocity);
-        }
-      }
-    }
-
-    // Mark this column as scheduled
-    scheduledColumns.add(col);
-  }
-
-  /**
-   * The scheduler loop that synchronizes MIDI playback with audio
-   */
-  function scheduleLoop() {
-    if (shouldStop) {
-      return;
-    }
-
-    if (syncMode && audioPlayer) {
-      const currentAudioTime = audioPlayer.currentTime;
-      const currentPlaybackRate = audioPlayer.playbackRate;
-
-      // If playback rate changed significantly, clear scheduled notes
-      if (Math.abs(currentPlaybackRate - lastPlaybackRate) > 0.05) {
-        scheduledColumns.clear();
-        lastPlaybackRate = currentPlaybackRate;
+      // Clear old scheduled notes if we've seeked
+      if (Math.abs(currentAudioTime - lastScheduledTime) > 1.0) {
+        this.clearScheduledNotes();
+        lastScheduledTime = currentAudioTime - 0.1; // Reset to just before current time
       }
 
-      // If the audio is actually playing
-      if (!audioPlayer.paused) {
-        // If we've jumped forward or backward significantly, reset our scheduling
-        if (Math.abs(currentAudioTime - lastCurrentTime) > 0.1) {
-          // Clear scheduled columns on seek
-          scheduledColumns.clear();
+      // Schedule new notes
+      for (let col = 0; col < guitarTab[0].length; col++) {
+        const noteTime = col * timePerColumn;
+
+        if (noteTime > lastScheduledTime && noteTime <= scheduleUntil) {
+          // Calculate when this note should play in context time
+          const deltaTime = noteTime - currentAudioTime + syncOffset;
+          const contextTime = currentContextTime + deltaTime;
+
+          // Only schedule if it's in the future (with small buffer)
+          if (contextTime > currentContextTime - 0.005) {
+            this.scheduleColumn(guitarTab, col, contextTime, timePerColumn);
+          }
+          lastScheduledTime = noteTime;
         }
+      }
 
-        lastCurrentTime = currentAudioTime;
+      this.animationFrame = requestAnimationFrame(scheduleNotes);
+    };
 
-        // Calculate the current column based on audio position
-        const currentColumn = Math.floor(currentAudioTime / timePerColumn);
+    scheduleNotes();
+  }
 
-        // Look ahead by 1.0 seconds to ensure smooth playback
-        // Adjust lookahead time based on playback rate - need more time at faster speeds
-        const lookAheadSeconds = 1.0 * Math.max(1, currentPlaybackRate);
-        const lookAheadColumns = Math.ceil(lookAheadSeconds / timePerColumn);
+  scheduleStandalone(guitarTab, timePerColumn, startPosition) {
+    const startColumn = Math.floor(startPosition / timePerColumn);
+    const contextStartTime = this.context.currentTime;
 
-        // Keep track of time for debugging if needed
-        if (Math.floor(currentAudioTime) !== Math.floor(lastLoggedTime || 0)) {
-          lastLoggedTime = currentAudioTime;
-        }
+    // Schedule all notes
+    for (let col = startColumn; col < guitarTab[0].length; col++) {
+      const noteTime = col * timePerColumn;
+      const scheduleTime = contextStartTime + (noteTime - startPosition) / this.playbackRate;
 
-        // Schedule columns from current to current + lookAhead, starting slightly before
-        for (let col = currentColumn - 2; col <= currentColumn + lookAheadColumns; col++) {
-          if (col >= 0 && col < numColumns && !scheduledColumns.has(col)) {
-            // Calculate the precise audio context time for this column
-            // Divide by playback rate to schedule notes correctly at different speeds
-            const columnOffset = (col - currentColumn) * timePerColumn / currentPlaybackRate;
-            let columnContextTime = audioContext.currentTime + columnOffset;
-            if (columnContextTime < audioContext.currentTime) {
-              columnContextTime = audioContext.currentTime; // Force to now if in past
-            }
+      this.scheduleColumn(guitarTab, col, scheduleTime, timePerColumn / this.playbackRate);
+    }
 
-            scheduleColumn(col, columnContextTime, currentPlaybackRate);
+    // Update virtual time
+    this.updateVirtualTime(startPosition);
+  }
+
+  scheduleColumn(guitarTab, column, when, duration) {
+    for (let string = 0; string < 6; string++) {
+      const fretData = guitarTab[string][column];
+
+      if (fretData && fretData !== '-' && fretData !== '~') {
+        // Parse fret and articulation
+        const { fret, articulation } = this.parseFretData(fretData);
+
+        if (fret !== null) {
+          // Check if this is the start of a sustained note
+          let sustainDuration = duration;
+          let col = column + 1;
+
+          while (col < guitarTab[0].length && guitarTab[string][col] === '~') {
+            sustainDuration += duration;
+            col++;
+          }
+
+          // Schedule the note
+          const note = this.synthesizer.playNote(
+            string,
+            fret,
+            when,
+            sustainDuration,
+            articulation,
+            0.8
+          );
+
+          if (note) {
+            this.scheduledNotes.push({
+              note: note,
+              endTime: when + sustainDuration
+            });
           }
         }
       }
-
-      // Keep the loop running
-      schedulerFrameId = requestAnimationFrame(scheduleLoop);
     }
   }
 
-  // If in sync mode, set up the scheduler
-  if (syncMode && audioPlayer) {
-    // Initialize timing references
-    startContextTime = audioContext.currentTime;
-    startAudioTime = audioPlayer.currentTime;
-    lastCurrentTime = audioPlayer.currentTime;
-    lastPlaybackRate = audioPlayer.playbackRate;
+  parseFretData(fretData) {
+    // Parse fret number and articulation markers
+    let fret = null;
+    let articulation = ARTICULATION.NORMAL;
 
-    // Clear any previously scheduled columns
-    scheduledColumns.clear();
+    // Handle string input
+    const fretStr = String(fretData).trim();
 
-    // Force initial scheduling of notes based on current position
-    const currentColumn = Math.floor(audioPlayer.currentTime / timePerColumn);
+    // Remove articulation markers and extract fret number
+    const match = fretStr.match(/^(\d+)([bhHrp~]*)$/);
 
-    // Calculate the precise audio context time for this column
-    const initialScheduleTime = audioContext.currentTime + 0.05; // Small delay to ensure scheduling works
+    if (match) {
+      fret = parseInt(match[1]);
+      const markers = match[2];
 
-    // Pre-schedule a few columns to ensure immediate sound
-    for (let col = currentColumn; col < currentColumn + 10 && col < numColumns; col++) {
-      const columnOffset = (col - currentColumn) * timePerColumn / audioPlayer.playbackRate;
-      scheduleColumn(col, initialScheduleTime + columnOffset, audioPlayer.playbackRate);
+      if (markers.includes('b')) {
+        articulation = ARTICULATION.BEND_UP;
+      } else if (markers.includes('r')) {
+        articulation = ARTICULATION.BEND_DOWN;
+      } else if (markers.includes('h') || markers.includes('H')) {
+        articulation = ARTICULATION.HAMMER_ON;
+      } else if (markers.includes('p')) {
+        articulation = ARTICULATION.PULL_OFF;
+      } else if (markers.includes('~')) {
+        articulation = ARTICULATION.VIBRATO;
+      }
+    } else if (/^\d+$/.test(fretStr)) {
+      // Just a number with no markers
+      fret = parseInt(fretStr);
     }
 
-    // Start the continuous scheduling loop
-    schedulerFrameId = requestAnimationFrame(scheduleLoop);
-
-    // Set up event handlers
-    const seekHandler = () => {
-      if (!shouldStop) {
-        scheduledColumns.clear();
-      }
-    };
-
-    const pauseHandler = () => {
-    };
-
-    const playHandler = () => {
-      // Schedule notes at the current position with a slight delay
-      const currentColumn = Math.floor(audioPlayer.currentTime / timePerColumn);
-      for (let col = currentColumn; col < currentColumn + 5 && col < numColumns; col++) {
-        if (!scheduledColumns.has(col)) {
-          const columnOffset = (col - currentColumn) * timePerColumn / audioPlayer.playbackRate;
-          scheduleColumn(col, audioContext.currentTime + 0.05 + columnOffset, audioPlayer.playbackRate);
-        }
-      }
-    };
-
-    // Handler for playback rate changes
-    const ratechangeHandler = () => {
-      if (!shouldStop && Math.abs(audioPlayer.playbackRate - lastPlaybackRate) > 0.05) {
-        // Clear all scheduled columns and re-compute with new rate
-        scheduledColumns.clear();
-        lastPlaybackRate = audioPlayer.playbackRate;
-      }
-    };
-
-    // Add event listeners
-    audioPlayer.addEventListener('seeking', seekHandler);
-    audioPlayer.addEventListener('pause', pauseHandler);
-    audioPlayer.addEventListener('play', playHandler);
-    audioPlayer.addEventListener('ratechange', ratechangeHandler);
-
-    // Return cleanup function that removes event listeners
-    const stop = () => {
-      shouldStop = true;
-
-      if (schedulerFrameId) {
-        cancelAnimationFrame(schedulerFrameId);
-        schedulerFrameId = null;
-      }
-
-      // Remove event listeners
-      audioPlayer.removeEventListener('seeking', seekHandler);
-      audioPlayer.removeEventListener('pause', pauseHandler);
-      audioPlayer.removeEventListener('play', playHandler);
-      audioPlayer.removeEventListener('ratechange', ratechangeHandler);
-
-      cleanupAudio();
-    };
-
-    return {
-      duration: numColumns * timePerColumn,
-      stop
-    };
+    return { fret, articulation };
   }
-  // Otherwise, play all notes immediately (standalone mode)
-  else {
-    // Get the current time from AudioContext for scheduling
-    const now = audioContext.currentTime;
 
-    // Add a slight pause before starting
-    const startOffset = 0.1;
+  updateVirtualTime(startTime) {
+    const startContextTime = this.context.currentTime;
 
-    // Use the playback rate passed directly as a parameter
-    const playbackSpeed = playbackRate;
+    const update = () => {
+      if (!this.isPlaying || this.syncSource) return;
 
-    // Calculate the starting column based on the provided startTime
-    const startColumnIndex = Math.floor(startTime * sampleRate / hopSize);
+      const elapsed = (this.context.currentTime - startContextTime) * this.playbackRate;
+      this.currentTime = startTime + elapsed;
 
-    // Create a virtual audio time tracker for standalone mode
-    // Initialize with provided start time
-    let virtualAudioTime = startTime;
-    let perfStartTime = performance.now() / 1000; // For tracking playback position
-    let isPlaying = true;
-
-    // Set up scroll animation for standalone mode
-    let scrollAnimationId = null;
-
-    // Function to update virtual time and scroll position
-    function updateVirtualTime() {
-      if (!isPlaying || shouldStop) {
-        cancelAnimationFrame(scrollAnimationId);
-        return;
-      }
-
-      // Calculate time passed since start, adjusted for playback speed
-      const elapsedTime = (performance.now() / 1000) - perfStartTime;
-      virtualAudioTime = startTime + (elapsedTime * playbackSpeed);
-
-      // Publish the virtual time to a custom event for main.js to use
+      // Dispatch time update event
       window.dispatchEvent(new CustomEvent('midiTimeUpdate', {
         detail: {
-          currentTime: virtualAudioTime,
-          duration: (numColumns * timePerColumn),
+          currentTime: this.currentTime,
           isPlaying: true
         }
       }));
 
-      // Continue the animation loop
-      scrollAnimationId = requestAnimationFrame(updateVirtualTime);
-    }
-
-    // Start the animation loop
-    scrollAnimationId = requestAnimationFrame(updateVirtualTime);
-
-    // Schedule only notes from the starting column onwards
-    for (let col = startColumnIndex; col < numColumns; col++) {
-      // Calculate time relative to the starting column
-      const columnTime = (col - startColumnIndex) * timePerColumn / playbackSpeed;
-      const noteStartTime = now + startOffset + columnTime;
-
-      // Enforce a minimum duration to ensure all notes are audible
-      const noteDuration = Math.max(0.1, (timePerColumn * 1.2) / playbackSpeed);
-
-      // Check each string at this time step
-      for (let s = 0; s < 6; s++) {
-        const fretValue = guitarTab[s][col];
-
-        if (fretValue !== '-') {
-          // Handle sustained note markers (starting with 's')
-          let fret;
-          let isStartingNote = true;
-
-          if (fretValue.startsWith('s')) {
-            // This is a sustained note - extract the fret number after the 's'
-            fret = fretValue.substring(1);
-            isStartingNote = false;
-          } else {
-            // This is the start of a note
-            fret = fretValue;
-          }
-
-          // Calculate MIDI note: base note of string plus fret number
-          const baseMidi = stringMidi[s];
-          const midiNote = baseMidi + parseInt(fret);
-          const frequency = midiToFrequency(midiNote);
-
-          // Only create a new tone for starting notes to avoid retriggering during sustain
-          if (isStartingNote) {
-            // Calculate the total duration by looking ahead to count sustained markers
-            let totalDuration = noteDuration;
-            let sustainCount = 0;
-
-            // Look ahead to count how many sustained markers follow this note
-            for (let nextCol = col + 1; nextCol < numColumns; nextCol++) {
-              const nextValue = guitarTab[s][nextCol];
-              if (nextValue === `s${fret}`) {
-                sustainCount++;
-              } else {
-                break; // Stop at the first non-matching value
-              }
-            }
-
-            // Extend the note duration based on sustained columns
-            if (sustainCount > 0) {
-              totalDuration = noteDuration * (sustainCount + 1);
-            }
-
-            // Velocity slightly higher for stand-alone mode
-            const velocity = 0.9;
-            createGuitarTone(frequency, noteStartTime, totalDuration, s, velocity);
-          }
-        }
-      }
-    }
-
-    // Total duration of playback (adjusted for playback speed and start position)
-    const fullDuration = (numColumns * timePerColumn);
-    const remainingDuration = (numColumns - startColumnIndex) * timePerColumn / playbackSpeed;
-
-    // Enhanced stop function for standalone mode
-    const enhancedStopAudio = () => {
-      isPlaying = false;
-      if (scrollAnimationId) {
-        cancelAnimationFrame(scrollAnimationId);
-      }
-
-      // Signal that MIDI playback has stopped
-      window.dispatchEvent(new CustomEvent('midiTimeUpdate', {
-        detail: {
-          isPlaying: false
-        }
-      }));
-
-      cleanupAudio();
+      this.animationFrame = requestAnimationFrame(update);
     };
 
-    // Return duration and enhanced stop function for standalone mode
-    return {
-      duration: fullDuration, // Full duration of the tab for reference
-      stop: enhancedStopAudio,
-      remainingDuration: remainingDuration + startOffset // For timing the auto-stop
-    };
+    update();
   }
 
-  /**
-   * Stops all scheduled and currently playing audio
-   */
-  function cleanupAudio() {
-    // Set the stop flag first
-    shouldStop = true;
+  clearScheduledNotes() {
+    const now = this.context.currentTime;
 
-    // Cancel any ongoing scheduler
-    if (schedulerFrameId) {
-      cancelAnimationFrame(schedulerFrameId);
-      schedulerFrameId = null;
-    }
-
-    if (audioContext.state !== 'closed') {
-      try {
-        // Try to stop all audio nodes
-        activeNodes.forEach((node) => {
-          if (node.stop) {
-            try {
-              node.stop(0); // Stop immediately if it's an oscillator
-            } catch (e) {
-              // Node might already be stopped
-            }
-          } else if (node.gain) {
-            // If it's a gain node, ramp it down
-            try {
-              node.gain.cancelScheduledValues(audioContext.currentTime);
-              node.gain.linearRampToValueAtTime(0, audioContext.currentTime + 0.02);
-            } catch (e) {
-              // Handle potential errors
-            }
-          }
-        });
-
-        // Fade out master volume quickly to avoid clicks
-        masterGain.gain.cancelScheduledValues(audioContext.currentTime);
-        masterGain.gain.linearRampToValueAtTime(0, audioContext.currentTime + 0.1);
-
-        // Clear the active nodes array
-        activeNodes.length = 0;
-
-        // Close the audio context after a short delay to allow fade-out
-        setTimeout(() => {
-          try {
-            audioContext.close();
-          } catch (e) {
-            console.error('Error closing audio context:', e);
-          }
-        }, 200);
-      } catch (e) {
-        console.error('Error stopping MIDI playback:', e);
+    this.scheduledNotes = this.scheduledNotes.filter(item => {
+      if (item.endTime < now) {
+        return false;
       }
+      return true;
+    });
+  }
+
+  stop() {
+    this.isPlaying = false;
+
+    if (this.animationFrame) {
+      cancelAnimationFrame(this.animationFrame);
+      this.animationFrame = null;
+    }
+
+    this.synthesizer.stopAllNotes();
+    this.scheduledNotes = [];
+
+    // Dispatch stop event
+    window.dispatchEvent(new CustomEvent('midiTimeUpdate', {
+      detail: {
+        isPlaying: false
+      }
+    }));
+  }
+
+  seek(time) {
+    if (this.isPlaying) {
+      this.currentTime = time;
+      this.clearScheduledNotes();
     }
   }
+
+  setPlaybackRate(rate) {
+    this.playbackRate = rate;
+  }
+
+  dispose() {
+    this.stop();
+    this.synthesizer.dispose();
+  }
+}
+
+/**
+ * Main entry point for playing tab as MIDI
+ */
+export async function playTabAsMidi(guitarTab, hopSize, sampleRate, audioPlayer = null, startTime = 0, playbackRate = 1.0) {
+  const audioContext = new AudioContext();
+
+  if (audioContext.state === 'suspended') {
+    await audioContext.resume();
+  }
+
+  const player = new MidiPlayer(audioContext);
+
+  return player.play(guitarTab, hopSize, sampleRate, audioPlayer, startTime, playbackRate);
 }

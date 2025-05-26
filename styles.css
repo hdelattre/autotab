@@ -60,9 +60,88 @@
   contain: layout style paint;
 }
 
-#tabContainer {
-  will-change: scroll-position;
-  -webkit-overflow-scrolling: touch;
+/* Articulation styles */
+.tab-column.bend-up::after{content:'b';font-size:.7em;vertical-align:super;margin-left:-2px;}
+.tab-column.bend-down::after{content:'r';font-size:.7em;vertical-align:super;margin-left:-2px;}
+.tab-column.hammer-on::after{content:'h';font-size:.7em;vertical-align:super;margin-left:-2px;}
+.tab-column.pull-off::after{content:'p';font-size:.7em;vertical-align:super;margin-left:-2px;}
+.tab-column.vibrato{animation:vibrato .2s ease-in-out infinite;}
+@keyframes vibrato{0%,100%{transform:translateX(0);}50%{transform:translateX(1px);}}
+
+/* Virtual scrolling styles */
+.tab-column.virtual {
+  position: absolute;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  contain: layout style paint;
+}
+
+/* Confidence indicator styles */
+.tab-column.low-confidence {
+  opacity: 0.5;
+  position: relative;
+}
+
+.tab-column.low-confidence::before {
+  content: '';
+  position: absolute;
+  bottom: -2px;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background-color: #dc3545; /* Red indicator */
+  opacity: 0.8;
+}
+
+.tab-column.medium-confidence {
+  opacity: 0.8;
+  position: relative;
+}
+
+.tab-column.medium-confidence::before {
+  content: '';
+  position: absolute;
+  bottom: -2px;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background-color: #ffc107; /* Yellow indicator */
+  opacity: 0.8;
+}
+
+.tab-column.high-confidence {
+  opacity: 1.0;
+  position: relative;
+}
+
+/* Optional: Show confidence value on hover */
+.tab-column[data-confidence]:hover::after {
+  content: attr(data-confidence);
+  position: absolute;
+  top: -20px;
+  left: 50%;
+  transform: translateX(-50%);
+  background-color: rgba(0, 0, 0, 0.8);
+  color: white;
+  padding: 2px 6px;
+  border-radius: 3px;
+  font-size: 10px;
+  white-space: nowrap;
+  z-index: 100;
+}
+
+/* Dark mode adjustments */
+.dark-mode .tab-column[data-confidence]:hover::after {
+  background-color: rgba(255, 255, 255, 0.9);
+  color: #000;
+}
+
+/* Performance optimizations */
+#smoothPlayhead {
+  will-change: transform;
+  contain: layout style paint;
 }
 
 *, *::before, *::after {
@@ -223,6 +302,11 @@ input[type="range"]:hover::-moz-range-thumb { background: var(--button-hover-bg)
   transition: background-color 0.2s ease, transform 0.1s ease;
   min-width: 110px;
   text-align: center;
+  margin-right: 10px;
+}
+
+.control-button:last-child {
+  margin-right: 0;
 }
 
 .control-button:hover {
@@ -273,12 +357,21 @@ input[type="range"]:hover::-moz-range-thumb { background: var(--button-hover-bg)
   bottom: 0;
   right: 0;
   overflow-x: auto; /* Container scrolls horizontally */
-  overflow-y: hidden;
+  overflow-y: auto; /* Allow vertical scroll if content exceeds container */
   background-color: transparent; /* Inherit from viewport or set specific */
   -webkit-overflow-scrolling: touch; /* Smooth scrolling on iOS */
   scrollbar-width: thin; /* Firefox */
   scrollbar-color: var(--secondary-accent-color) var(--bg-color); /* Firefox */
-  position: relative; /* Needed for absolute positioning of children */
+  
+  /* Sub-pixel smooth scrolling */
+  scroll-behavior: smooth;
+  will-change: scroll-position;
+  
+  /* Hardware acceleration */
+  transform: translateZ(0);
+  -webkit-transform: translateZ(0);
+  backface-visibility: hidden;
+  -webkit-backface-visibility: hidden;
 }
 #tabContainer::-webkit-scrollbar {
     height: 8px;
@@ -295,7 +388,7 @@ input[type="range"]:hover::-moz-range-thumb { background: var(--button-hover-bg)
 
 #tabDisplay {
   --column-width: 20px; /* Default fallback */
-  white-space: nowrap; /* Ensure columns stay in one line */
+  --min-column-width: 20px; /* Minimum for 2-digit numbers */
   display: inline-block; /* Allows container to size to content */
   min-width: 100%; /* Ensure it fills viewport initially */
   padding: 15px 15px 15px 0; /* Padding top/bottom/right */
@@ -317,6 +410,7 @@ input[type="range"]:hover::-moz-range-thumb { background: var(--button-hover-bg)
   height: 28px; /* Fixed height for vertical alignment */
   margin-bottom: 2px; /* Small gap between lines */
   overflow: visible; /* Ensure lines don't clip content */
+  white-space: nowrap; /* Keep columns in this line horizontal */
 }
 
 /* String Labels (Sticky) */
@@ -338,7 +432,7 @@ input[type="range"]:hover::-moz-range-thumb { background: var(--button-hover-bg)
 .tab-column {
   display: inline-block;
   width: var(--column-width); /* Use the CSS variable */
-  padding: 0; /* Remove horizontal padding to allow narrower columns */
+  padding: 0; /* Remove padding for narrow columns */
   text-align: center;
   box-sizing: border-box;
   position: relative; /* Allows z-index to work */
@@ -349,7 +443,7 @@ input[type="range"]:hover::-moz-range-thumb { background: var(--button-hover-bg)
   overflow: visible; /* Crucial: Allow content to spill out */
   /* Handle narrow columns */
   white-space: nowrap;
-  min-width: 4px; /* Absolute minimum width - even at max zoom */
+  min-width: 4px; /* Small minimum for max zoom */
   /* Allow overlap management */
   z-index: 0; /* Default z-index */
   vertical-align: middle; /* Align content consistently */
@@ -364,11 +458,32 @@ input[type="range"]:hover::-moz-range-thumb { background: var(--button-hover-bg)
 .tab-column.note-start {
   font-weight: bold;
   color: var(--tab-note-color);
-  font-size: 0.95em; /* Slightly smaller for narrow columns */
-  /* Improve readability at high zoom */
+  /* Dynamic font size that scales with column width */
+  /* At 6-20px: 0.8em, scales up to 1.3em at 40px+ */
+  font-size: min(1.3em, calc(0.8em + max(0em, (var(--column-width) - 20px) * 0.4)));
+  /* Allow content to overflow */
+  overflow: visible !important;
+  position: relative;
+  z-index: 10; /* High z-index to ensure visibility */
+  /* Remove constraints */
   text-overflow: visible;
   max-width: none;
+  min-width: auto;
+  /* Ensure text doesn't wrap */
+  white-space: nowrap;
+  /* Add slight background for readability */
+  background: var(--container-bg);
+  /* Negative margins to allow overlap */
+  margin: 0 -2px;
+  /* Padding to ensure content has space */
+  padding: 0 2px;
 }
+
+/* Ensure adjacent columns don't cover notes */
+.tab-column.note-start + .tab-column {
+  z-index: 0;
+}
+
 
 /* Sustain markers (-) */
 .tab-column.sustained {
@@ -380,26 +495,6 @@ input[type="range"]:hover::-moz-range-thumb { background: var(--button-hover-bg)
   letter-spacing: -0.5px;
 }
 
-/* Active column under playhead */
-.tab-column.active {
-  background-color: var(--note-active-bg);
-  font-weight: bold;
-  color: var(--tab-note-color) !important; /* Ensure visibility */
-  box-shadow: 0 0 5px var(--note-active-shadow);
-  position: relative;
-  z-index: 10; /* Higher z-index to appear on top */
-  border-radius: 2px;
-}
-
-/* Optional: highlight adjacent columns */
-.tab-column.prev-active,
-.tab-column.next-active {
-  background-color: rgba(128, 128, 128, 0.1); /* Subtle grey */
-}
-.dark-mode .tab-column.prev-active,
-.dark-mode .tab-column.next-active {
-  background-color: rgba(255, 255, 255, 0.08); /* Subtle grey */
-}
 
 /* Pulse animation on note play */
 @keyframes notePulse {
