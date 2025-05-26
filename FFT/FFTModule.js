@@ -9,6 +9,8 @@ export default class FFT {
         this.cqtOutputRealPtr = null;
         this.cqtOutputImagPtr = null;
         this.memoryGeneration = 0;
+        this._initialized = false;
+        this._cqtInitialized = false;
     }
 
     async init() {
@@ -28,14 +30,34 @@ export default class FFT {
             throw new Error("Failed to initialize FFT.");
         }
 
+        this._allocateBuffers();
+        this._initialized = true;
+    }
+
+    _allocateBuffers() {
+        // Free existing buffers if any
+        this._freeBuffers();
+
         this.realPtr = this.module._malloc(this.size * 4);
         this.imagPtr = this.module._malloc(this.size * 4);
+
         if (!this.realPtr || !this.imagPtr) {
-            this.dispose();
-            throw new Error("Memory allocation failed in init.");
+            this._freeBuffers();
+            throw new Error("Memory allocation failed.");
         }
 
         this._updateArrayViews();
+    }
+
+    _freeBuffers() {
+        if (this.realPtr) {
+            this.module._free(this.realPtr);
+            this.realPtr = null;
+        }
+        if (this.imagPtr) {
+            this.module._free(this.imagPtr);
+            this.imagPtr = null;
+        }
     }
 
     _updateArrayViews() {
@@ -44,7 +66,7 @@ export default class FFT {
         this.real = new Float32Array(this.module.HEAPF32.buffer, this.realPtr, this.size);
         this.imag = new Float32Array(this.module.HEAPF32.buffer, this.imagPtr, this.size);
 
-        if (this.cqtOutputRealPtr) {
+        if (this.cqtOutputRealPtr && this._cqtInitialized) {
             this.cqtOutputReal = new Float32Array(this.module.HEAPF32.buffer, this.cqtOutputRealPtr, this.cqtTotalBins);
             this.cqtOutputImag = new Float32Array(this.module.HEAPF32.buffer, this.cqtOutputImagPtr, this.cqtTotalBins);
         }
@@ -56,8 +78,64 @@ export default class FFT {
         }
     }
 
+    /**
+     * Resize the FFT to a new size
+     * @param {number} newSize - New FFT size (must be power of two)
+     */
+    async resize(newSize) {
+        if (!this._initialized) {
+            throw new Error("FFT not initialized.");
+        }
+
+        if (!Number.isInteger(newSize) || newSize <= 0) {
+            throw new Error("FFT size must be a positive integer.");
+        }
+
+        if ((newSize & (newSize - 1)) !== 0) {
+            throw new Error("FFT size must be a power of two.");
+        }
+
+        if (newSize === this.size) {
+            return; // No change needed
+        }
+
+        // Store CQT parameters if initialized
+        let cqtParams = null;
+        if (this._cqtInitialized) {
+            cqtParams = {
+                binsPerOctave: this.cqtBinsPerOctave,
+                octaves: this.cqtOctaves,
+                sampleRate: this.cqtSampleRate,
+                minFreq: this.cqtMinFreq
+            };
+        }
+
+        // Update size
+        this.size = newSize;
+
+        // Re-initialize FFT with new size
+        if (!this.module._initFFT(this.size)) {
+            throw new Error("Failed to resize FFT.");
+        }
+
+        // Reallocate buffers
+        this._allocateBuffers();
+
+        // Re-initialize CQT if it was previously initialized
+        if (cqtParams) {
+            await this.initCQT(
+                cqtParams.binsPerOctave,
+                cqtParams.octaves,
+                cqtParams.sampleRate,
+                cqtParams.minFreq
+            );
+        }
+    }
+
     fft(inputReal, output = null) {
-        if (!this.module) throw new Error("Module not initialized.");
+        if (!this.module || !this._initialized) {
+            throw new Error("Module not initialized.");
+        }
         if (!inputReal || inputReal.length !== this.size) {
             throw new Error("Input array must match FFT size.");
         }
@@ -80,14 +158,19 @@ export default class FFT {
     }
 
     async initCQT(binsPerOctave, octaves, sampleRate, minFreq) {
-        if (!this.module) throw new Error("Module not initialized.");
+        if (!this.module || !this._initialized) {
+            throw new Error("Module not initialized.");
+        }
         if (!Number.isInteger(binsPerOctave) || !Number.isInteger(octaves) ||
             binsPerOctave <= 0 || octaves <= 0 || sampleRate <= 0 || minFreq <= 0) {
             throw new Error("Invalid CQT parameters.");
         }
 
+        // Store parameters
         this.cqtBinsPerOctave = binsPerOctave;
         this.cqtOctaves = octaves;
+        this.cqtSampleRate = sampleRate;
+        this.cqtMinFreq = minFreq;
         this.cqtTotalBins = binsPerOctave * octaves;
 
         if (!this.module._initCQT(binsPerOctave, octaves, this.size, sampleRate, minFreq)) {
@@ -105,14 +188,18 @@ export default class FFT {
             if (this.cqtOutputImagPtr) this.module._free(this.cqtOutputImagPtr);
             this.cqtOutputRealPtr = null;
             this.cqtOutputImagPtr = null;
+            this._cqtInitialized = false;
             throw new Error("Memory allocation failed in initCQT.");
         }
 
+        this._cqtInitialized = true;
         this._updateArrayViews();
     }
 
     cqt(inputReal, output = null) {
-        if (!this.module || !this.cqtOutputRealPtr) throw new Error("CQT not initialized.");
+        if (!this.module || !this._initialized || !this._cqtInitialized) {
+            throw new Error("CQT not initialized.");
+        }
         if (!inputReal || inputReal.length !== this.size) {
             throw new Error("Input array must match FFT size.");
         }
@@ -120,7 +207,12 @@ export default class FFT {
         this._checkMemoryResize();
 
         // Compute FFT first
-        this.fft(inputReal);
+        this.real.set(inputReal);
+        this.imag.fill(0);
+
+        if (!this.module._fft(this.realPtr, this.imagPtr, this.size)) {
+            throw new Error("FFT computation failed.");
+        }
 
         if (!this.module._cqt(
             this.realPtr,
@@ -147,8 +239,7 @@ export default class FFT {
 
     dispose() {
         if (this.module) {
-            if (this.realPtr) this.module._free(this.realPtr);
-            if (this.imagPtr) this.module._free(this.imagPtr);
+            this._freeBuffers();
             if (this.cqtOutputRealPtr) this.module._free(this.cqtOutputRealPtr);
             if (this.cqtOutputImagPtr) this.module._free(this.cqtOutputImagPtr);
             this.module._freeFFT();
@@ -156,6 +247,8 @@ export default class FFT {
             this.module = null;
             this.realPtr = this.imagPtr = this.cqtOutputRealPtr = this.cqtOutputImagPtr = null;
             this.real = this.imag = this.cqtOutputReal = this.cqtOutputImag = null;
+            this._initialized = false;
+            this._cqtInitialized = false;
         }
     }
 }
