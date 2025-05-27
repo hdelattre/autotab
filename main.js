@@ -964,6 +964,15 @@ audioInput.addEventListener('change', async (e) => {
   }
 
   try {
+    // Stop any existing MIDI playback
+    if (midiPlayer) {
+      stopMidiPlayback();
+    }
+    
+    // Reset audio playback
+    audioPlayer.pause();
+    audioPlayer.currentTime = 0;
+    
     // Show loading state
     tabDisplay.innerHTML = '<pre>Loading...</pre>';
 
@@ -978,6 +987,20 @@ audioInput.addEventListener('change', async (e) => {
     tempoSlider.value = 1.0;
     tempoValue.textContent = "1.0x";
     playbackRate = 1.0;
+    
+    // Disable MIDI buttons until processing is complete
+    toggleMidiButton.disabled = true;
+    exportMidiButton.disabled = true;
+    toggleMidiButton.textContent = 'Play MIDI';
+    toggleMidiButton.classList.remove('active');
+    
+    // Exit edit mode if active
+    if (isEditMode) {
+      isEditMode = false;
+      editModeButton.classList.remove('active');
+      editModeButton.textContent = 'Edit Mode';
+      tabDisplay.classList.remove('edit-mode');
+    }
 
     // Set audio player source
     const audioURL = URL.createObjectURL(file);
