@@ -195,25 +195,30 @@ class KarplusStrongString {
   }
 
   pluck(startTime, velocity = 1.0, pluckPosition = 0.9) {
+    // Ensure startTime is never in the past
+    const safeStartTime = Math.max(startTime, this.context.currentTime);
+    
     // Adjust filter based on pluck position (brightness)
     this.filter.frequency.setValueAtTime(
       2000 + 3000 * pluckPosition,
-      startTime
+      safeStartTime
     );
 
     // Start noise burst
-    this.noise.start(startTime);
-    this.noise.stop(startTime + 0.01); // Very short burst
+    this.noise.start(safeStartTime);
+    this.noise.stop(safeStartTime + 0.01); // Very short burst
 
     // Apply velocity
-    this.output.gain.setValueAtTime(velocity, startTime);
+    this.output.gain.setValueAtTime(velocity, safeStartTime);
 
     return this.output;
   }
 
   stop(time) {
+    // Ensure time is never in the past
+    const safeTime = Math.max(time, this.context.currentTime);
     // Quickly damp the string
-    this.feedback.gain.exponentialRampToValueAtTime(0.001, time + 0.1);
+    this.feedback.gain.exponentialRampToValueAtTime(0.001, safeTime + 0.1);
 
     // Schedule cleanup
     setTimeout(() => {
@@ -221,7 +226,7 @@ class KarplusStrongString {
       this.filter.disconnect();
       this.delay.disconnect();
       this.feedback.disconnect();
-    }, (time - this.context.currentTime + 0.5) * 1000);
+    }, Math.max(0, (safeTime - this.context.currentTime + 0.5) * 1000));
   }
 }
 
@@ -312,27 +317,30 @@ class GuitarString {
   createNormalNote(frequency, startTime, duration, velocity) {
     const note = new GuitarNote(this.context);
 
+    // Ensure startTime is never in the past
+    const safeStartTime = Math.max(startTime, this.context.currentTime);
+
     // Create oscillators
     const fundamental = this.context.createOscillator();
     fundamental.type = 'sawtooth';
-    fundamental.frequency.setValueAtTime(frequency, startTime);
+    fundamental.frequency.setValueAtTime(frequency, safeStartTime);
 
     const octave = this.context.createOscillator();
     octave.type = 'square';
-    octave.frequency.setValueAtTime(frequency * 2, startTime);
+    octave.frequency.setValueAtTime(frequency * 2, safeStartTime);
 
     // Create envelope
     const envelope = this.context.createGain();
-    envelope.gain.setValueAtTime(0, startTime);
-    envelope.gain.linearRampToValueAtTime(velocity, startTime + 0.002);
-    envelope.gain.exponentialRampToValueAtTime(velocity * 0.3, startTime + 0.05);
-    envelope.gain.exponentialRampToValueAtTime(0.001, startTime + duration);
+    envelope.gain.setValueAtTime(0, safeStartTime);
+    envelope.gain.linearRampToValueAtTime(velocity, safeStartTime + 0.002);
+    envelope.gain.exponentialRampToValueAtTime(velocity * 0.3, safeStartTime + 0.05);
+    envelope.gain.exponentialRampToValueAtTime(0.001, safeStartTime + duration);
 
     // Create filter
     const filter = this.context.createBiquadFilter();
     filter.type = 'lowpass';
-    filter.frequency.setValueAtTime(2000 + frequency, startTime);
-    filter.frequency.exponentialRampToValueAtTime(1000, startTime + duration);
+    filter.frequency.setValueAtTime(2000 + frequency, safeStartTime);
+    filter.frequency.exponentialRampToValueAtTime(1000, safeStartTime + duration);
     filter.Q.value = 2;
 
     // Oscillator gains
@@ -350,10 +358,10 @@ class GuitarString {
     filter.connect(envelope);
 
     // Start and stop
-    fundamental.start(startTime);
-    octave.start(startTime);
-    fundamental.stop(startTime + duration + 0.5);
-    octave.stop(startTime + duration + 0.5);
+    fundamental.start(safeStartTime);
+    octave.start(safeStartTime);
+    fundamental.stop(safeStartTime + duration + 0.5);
+    octave.stop(safeStartTime + duration + 0.5);
 
     note.oscillators = [fundamental, octave];
     note.output = envelope;
@@ -618,7 +626,7 @@ export class MidiPlayer {
           const contextTime = currentContextTime + deltaTime;
 
           // Only schedule if it's in the future (with small buffer)
-          if (contextTime > currentContextTime - 0.005) {
+          if (contextTime > currentContextTime + 0.001) {
             this.scheduleColumn(guitarTab, col, contextTime, timePerColumn);
           }
           lastScheduledTime = noteTime;
@@ -640,7 +648,10 @@ export class MidiPlayer {
       const noteTime = col * timePerColumn;
       const scheduleTime = contextStartTime + (noteTime - startPosition) / this.playbackRate;
 
-      this.scheduleColumn(guitarTab, col, scheduleTime, timePerColumn / this.playbackRate);
+      // Only schedule if the time is in the future
+      if (scheduleTime > contextStartTime) {
+        this.scheduleColumn(guitarTab, col, scheduleTime, timePerColumn / this.playbackRate);
+      }
     }
 
     // Update virtual time
