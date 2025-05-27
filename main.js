@@ -66,6 +66,7 @@ const tempoSlider = document.getElementById('tempoSlider');
 const tempoValue = document.getElementById('tempoValue');
 const toggleMidiButton = document.getElementById('toggleMidiButton');
 const exportMidiButton = document.getElementById('exportMidiButton');
+const editModeButton = document.getElementById('editModeButton');
 const smoothPlayhead = document.getElementById('smoothPlayhead');
 
 // Web Worker (initialized lazily)
@@ -85,6 +86,8 @@ let virtualScroller = null;
 let useVirtualScrolling = true; // Feature flag
 // MIDI exporter instance
 let midiExporter = new MidiExporter();
+// Edit mode state
+let isEditMode = false;
 
 
 // Define a unified playhead state tracker
@@ -211,6 +214,14 @@ function handleTabClick(event) {
 
   if (isNaN(columnIndex) || isNaN(stringIndex)) return;
 
+  // Check if we're in edit mode
+  if (isEditMode) {
+    // Edit mode: allow editing the note
+    handleEditNote(stringIndex, columnIndex, clickTarget);
+    return;
+  }
+
+  // Normal mode: seek to position
   // Get more precise click position within the column (for better accuracy)
   const rect = clickTarget.getBoundingClientRect();
   const clickXWithinColumn = event.clientX - rect.left;
@@ -248,6 +259,155 @@ function handleTabClick(event) {
   updateActiveColumn(Math.floor(exactColumnIndex));
 
   // If audio was playing and we're using MIDI, seeking is handled automatically
+}
+
+/**
+ * Handle editing a note in edit mode
+ * @param {number} stringIndex - The string index (0-5, where 0 is high E)
+ * @param {number} columnIndex - The column index
+ * @param {HTMLElement} clickTarget - The clicked element
+ * @returns {void}
+ */
+function handleEditNote(stringIndex, columnIndex, clickTarget) {
+  if (!currentGuitarTab) return;
+  
+  // Prevent multiple inputs
+  if (clickTarget.querySelector('input')) return;
+  
+  // Get current value
+  const currentValue = currentGuitarTab[stringIndex][columnIndex];
+  
+  // Create inline input
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.className = 'inline-edit-input';
+  input.value = currentValue === '-' ? '' : currentValue;
+  input.maxLength = 2;
+  
+  // Store original content
+  const originalContent = clickTarget.textContent;
+  
+  // Replace content with input
+  clickTarget.textContent = '';
+  clickTarget.appendChild(input);
+  
+  // Focus and select
+  input.focus();
+  input.select();
+  
+  let updateValue = (value) => {
+    input.remove();
+    
+    // Validate and update
+    if (value === '') {
+      currentGuitarTab[stringIndex][columnIndex] = '-';
+    } else {
+      const fretNum = parseInt(value);
+      if (!isNaN(fretNum) && fretNum >= 0 && fretNum <= 24) {
+        currentGuitarTab[stringIndex][columnIndex] = fretNum.toString();
+      } else {
+        // Restore original if invalid
+        clickTarget.textContent = originalContent;
+        return;
+      }
+    }
+    
+    // Update display
+    const newValue = currentGuitarTab[stringIndex][columnIndex];
+    clickTarget.textContent = newValue;
+    
+    // Update classes based on new value
+    clickTarget.className = 'tab-column';
+    clickTarget.dataset.column = columnIndex;
+    clickTarget.dataset.string = stringIndex;
+    
+    if (newValue !== '-' && !isNaN(parseInt(newValue))) {
+      // Check if this should be a note-start by looking at previous columns
+      let isNoteStart = true;
+      if (columnIndex > 0) {
+        const prevValue = currentGuitarTab[stringIndex][columnIndex - 1];
+        if (prevValue !== '-' && !isNaN(parseInt(prevValue))) {
+          isNoteStart = false;
+        }
+      }
+      if (isNoteStart) {
+        clickTarget.classList.add('note-start');
+      }
+    }
+    
+    // Update subsequent sustained notes if needed
+    updateSustainedNotesAfterEdit(stringIndex, columnIndex);
+  };
+  
+  // Use flag to prevent double processing
+  let processed = false;
+  
+  // Handle input events
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === 'Tab') {
+      e.preventDefault();
+      if (!processed) {
+        processed = true;
+        updateValue(input.value);
+      }
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      processed = true; // Mark as processed to skip blur handler
+      if (input.parentNode) {
+        input.remove();
+      }
+      clickTarget.textContent = originalContent;
+    } else if (!/[0-9]/.test(e.key) && !['Backspace', 'Delete', 'ArrowLeft', 'ArrowRight'].includes(e.key)) {
+      e.preventDefault();
+    }
+  });
+  
+  input.addEventListener('blur', () => {
+    if (!processed) {
+      processed = true;
+      updateValue(input.value);
+    }
+  });
+}
+
+/**
+ * Update sustained note markers after an edit
+ * @param {number} stringIndex - The string index
+ * @param {number} startColumn - The column that was edited
+ */
+function updateSustainedNotesAfterEdit(stringIndex, startColumn) {
+  if (!currentGuitarTab || !columnElements[stringIndex]) return;
+  
+  // Update visual display for affected columns
+  const row = currentGuitarTab[stringIndex];
+  const columns = columnElements[stringIndex];
+  
+  // Process a few columns after the edit to update sustained markers
+  for (let i = startColumn + 1; i < Math.min(startColumn + 10, row.length); i++) {
+    const value = row[i];
+    const col = columns[i];
+    if (!col) continue;
+    
+    // Update the display based on context
+    col.className = 'tab-column';
+    col.dataset.column = i;
+    col.dataset.string = stringIndex;
+    col.textContent = value;
+    
+    // If it's a number, check if it should be note-start
+    if (value !== '-' && !isNaN(parseInt(value))) {
+      let isNoteStart = true;
+      if (i > 0 && row[i-1] !== '-' && !isNaN(parseInt(row[i-1]))) {
+        isNoteStart = false;
+      }
+      if (isNoteStart) {
+        col.classList.add('note-start');
+      }
+    }
+    
+    // Stop when we hit a new note
+    if (value !== '-') break;
+  }
 }
 
 /**
@@ -1018,6 +1178,14 @@ toggleMidiButton.addEventListener('click', () => {
 // When starting the application, disable the MIDI button until data is available
 toggleMidiButton.disabled = true;
 exportMidiButton.disabled = true;
+
+// Edit mode button event listener
+editModeButton.addEventListener('click', () => {
+  isEditMode = !isEditMode;
+  editModeButton.textContent = isEditMode ? 'Exit Edit Mode' : 'Edit Mode';
+  editModeButton.classList.toggle('active', isEditMode);
+  tabViewport.classList.toggle('edit-mode', isEditMode);
+});
 
 // Export MIDI button event listener
 exportMidiButton.addEventListener('click', () => {
