@@ -298,9 +298,48 @@ function handleEditNote(stringIndex, columnIndex, clickTarget) {
   let updateValue = (value) => {
     input.remove();
     
+    let prevNoteColumn = -1;
+    
+    // Check if MIDI is playing and we need to restart it
+    const wasMidiPlaying = midiPlayer && midiPlayer.isPlaying;
+    let midiStartTime = 0;
+    if (wasMidiPlaying) {
+      midiStartTime = midiPlayer.getCurrentTime();
+    }
+    
     // Validate and update
-    if (value === '') {
+    if (value === '' || value === '-') {
       currentGuitarTab[stringIndex][columnIndex] = '-';
+      // Clear any sustained notes to the right
+      for (let col = columnIndex + 1; col < currentGuitarTab[stringIndex].length; col++) {
+        const val = currentGuitarTab[stringIndex][col];
+        if (val === '~') {
+          // This is a sustained note marker, clear it
+          currentGuitarTab[stringIndex][col] = '-';
+        } else {
+          // Hit a new note or dash, stop clearing
+          break;
+        }
+      }
+    } else if (value === '~') {
+      // Find the previous note to extend
+      for (let col = columnIndex - 1; col >= 0; col--) {
+        const val = currentGuitarTab[stringIndex][col];
+        if (val !== '-' && !isNaN(parseInt(val))) {
+          prevNoteColumn = col;
+          break;
+        }
+      }
+      
+      if (prevNoteColumn >= 0) {
+        // Fill all positions between the previous note and current position with sustained markers
+        for (let col = prevNoteColumn + 1; col <= columnIndex; col++) {
+          currentGuitarTab[stringIndex][col] = '~';
+        }
+      } else {
+        // No previous note to extend, make it a dash
+        currentGuitarTab[stringIndex][columnIndex] = '-';
+      }
     } else {
       const fretNum = parseInt(value);
       if (!isNaN(fretNum) && fretNum >= 0 && fretNum <= 24) {
@@ -312,31 +351,26 @@ function handleEditNote(stringIndex, columnIndex, clickTarget) {
       }
     }
     
-    // Update display
-    const newValue = currentGuitarTab[stringIndex][columnIndex];
-    clickTarget.textContent = newValue;
     
-    // Update classes based on new value
-    clickTarget.className = 'tab-column';
-    clickTarget.dataset.column = columnIndex;
-    clickTarget.dataset.string = stringIndex;
+    // Re-render the tab to ensure proper visual update
+    renderTab(currentGuitarTab);
     
-    if (newValue !== '-' && !isNaN(parseInt(newValue))) {
-      // Check if this should be a note-start by looking at previous columns
-      let isNoteStart = true;
-      if (columnIndex > 0) {
-        const prevValue = currentGuitarTab[stringIndex][columnIndex - 1];
-        if (prevValue !== '-' && !isNaN(parseInt(prevValue))) {
-          isNoteStart = false;
+    // Restart MIDI if it was playing
+    if (wasMidiPlaying) {
+      // Stop current playback
+      midiPlayer.stop();
+      
+      // Small delay to ensure visual updates are complete
+      setTimeout(async () => {
+        if (audioPlayer && !audioPlayer.paused) {
+          // Synced mode
+          await startSyncedMidiPlayback();
+        } else {
+          // Standalone mode
+          await startStandaloneMidiPlayback(midiStartTime);
         }
-      }
-      if (isNoteStart) {
-        clickTarget.classList.add('note-start');
-      }
+      }, 50);
     }
-    
-    // Update subsequent sustained notes if needed
-    updateSustainedNotesAfterEdit(stringIndex, columnIndex);
   };
   
   // Use flag to prevent double processing
@@ -357,7 +391,7 @@ function handleEditNote(stringIndex, columnIndex, clickTarget) {
         input.remove();
       }
       clickTarget.textContent = originalContent;
-    } else if (!/[0-9]/.test(e.key) && !['Backspace', 'Delete', 'ArrowLeft', 'ArrowRight'].includes(e.key)) {
+    } else if (!/[0-9-~]/.test(e.key) && !['Backspace', 'Delete', 'ArrowLeft', 'ArrowRight'].includes(e.key)) {
       e.preventDefault();
     }
   });
@@ -382,8 +416,10 @@ function updateSustainedNotesAfterEdit(stringIndex, startColumn) {
   const row = currentGuitarTab[stringIndex];
   const columns = columnElements[stringIndex];
   
-  // Process a few columns after the edit to update sustained markers
-  for (let i = startColumn + 1; i < Math.min(startColumn + 10, row.length); i++) {
+  // Process columns after the edit to update sustained markers
+  // If startColumn is 0, process the entire row
+  const endColumn = startColumn === 0 ? row.length : Math.min(startColumn + 50, row.length);
+  for (let i = startColumn + 1; i < endColumn; i++) {
     const value = row[i];
     const col = columns[i];
     if (!col) continue;
@@ -403,10 +439,9 @@ function updateSustainedNotesAfterEdit(stringIndex, startColumn) {
       if (isNoteStart) {
         col.classList.add('note-start');
       }
+    } else if (value === '~') {
+      col.classList.add('sustained');
     }
-    
-    // Stop when we hit a new note
-    if (value !== '-') break;
   }
 }
 
@@ -585,11 +620,19 @@ function processSustainedNotes(row) {
   const out = [];
   for (let i = 0; i < row.length; i++) {
     const t = row[i];
-    if (t === '-') out.push({ fret: '-', sustained: false, isFirstNote: false });
-    else if (t === '-' || t.startsWith('s')) {
-      const num = t.startsWith('s') ? t.substring(1) : null;
+    if (t === '-') {
+      out.push({ fret: '-', sustained: false, isFirstNote: false });
+    } else if (t === '~') {
+      // Tilde indicates a sustained note
+      out.push({ fret: '~', sustained: true, isFirstNote: false });
+    } else if (t.startsWith('s')) {
+      // Legacy sustained note format
+      const num = t.substring(1);
       out.push({ fret: '-', sustained: true, actualFret: num, isFirstNote: false });
-    } else out.push({ fret: t, sustained: false, isFirstNote: true });
+    } else {
+      // It's a fret number
+      out.push({ fret: t, sustained: false, isFirstNote: true });
+    }
   }
   return out;
 }
