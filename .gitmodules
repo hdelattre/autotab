@@ -1,0 +1,3 @@
+[submodule "WaveFFT"]
+	path = WaveFFT
+	url = https://github.com/hdelattre/WaveFFT.git

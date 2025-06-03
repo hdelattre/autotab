@@ -1,4 +1,4 @@
-import FFT from './FFT/FFTModule.js';
+import WaveFFT from './WaveFFT/WaveFFT.js';
 import GuitarNoteDetector from './GuitarNoteDetector.js';
 
 let detector = null;
@@ -51,16 +51,14 @@ self.onmessage = async (e) => {
       detector = null;
     }
 
-    // Only recreate FFT if size changed or not initialized
-    if (!fftInstance || fftInstance.size !== fftSize) {
-      if (fftInstance) {
-        fftInstance.dispose();
-        fftInstance = null;
-      }
-
+    // Only recreate FFT if not initialized
+    if (!fftInstance) {
       // Initialize FFT
-      fftInstance = new FFT(fftSize);
+      fftInstance = new WaveFFT(fftSize);
       await fftInstance.init();
+    } else if (fftInstance.size !== fftSize) {
+      // Use resize method instead of recreating
+      await fftInstance.resize(fftSize);
     }
 
     // Guitar-specific parameters (restored from working version)
