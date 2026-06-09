@@ -4,6 +4,8 @@ const DEFAULT_DISPLAY_WINDOW_SECONDS = 3;
 const PLAYHEAD_FIXED_OFFSET_PX = 20;
 const MIN_COLUMN_WIDTH_CALC = 6;
 const MIN_COLUMN_WIDTH_RENDERED = 6.5;
+const AUTO_SCROLL_CLOCK_RESET_THRESHOLD_SECONDS = 0.35;
+const AUTO_SCROLL_MAX_LEAD_SECONDS = 0.08;
 
 let sampleRate = 44100;
 let displayWindowSeconds = DEFAULT_DISPLAY_WINDOW_SECONDS;
@@ -12,6 +14,8 @@ let labelWidthPx = 35;
 let playbackRate = 1.0;
 let columnElements = [];
 let effectiveColumnWidthCache = MIN_COLUMN_WIDTH_RENDERED;
+let lastAnimatedColumnIndex = -1;
+let autoScrollClock = null;
 
 // Import new MIDI player, virtual scroller, and MIDI exporter
 import { MidiPlayer } from './midiPlayer.js';
@@ -248,6 +252,7 @@ function handleTabClick(event) {
   // --- Immediate Visual Update ---
   // Force scroll position
   const scrollPos = calculateScrollPosition(exactColumnIndex);
+  resetAutoScrollClock();
   tabContainer.scrollLeft = scrollPos;
 
   // Force smooth playhead position update
@@ -460,6 +465,8 @@ function renderTab(guitarTab, confidenceMap = null) {
 
   const numStrings = guitarTab.length;
   const numColumns = guitarTab[0].length;
+  lastAnimatedColumnIndex = -1;
+  resetAutoScrollClock();
 
   // Ensure column width is calculated before rendering
   if (!columnWidth || columnWidth <= 0) {
@@ -725,6 +732,56 @@ function getEffectiveColumnWidth() {
 /**
  * @returns {void}
  */
+function resetAutoScrollClock() {
+  autoScrollClock = null;
+}
+
+/**
+ * @param {number} sourceTime
+ * @param {number} totalDuration
+ * @param {number} rate
+ * @param {string} sourceId
+ * @returns {number}
+ */
+function getAutoScrollClockTime(sourceTime, totalDuration, rate, sourceId) {
+  const now = performance.now();
+  const mediaTime = Number.isFinite(sourceTime) ? Math.max(0, sourceTime) : 0;
+  const playbackRate = Number.isFinite(rate) && rate > 0 ? rate : 1;
+
+  if (
+    !autoScrollClock ||
+    autoScrollClock.sourceId !== sourceId ||
+    autoScrollClock.playbackRate !== playbackRate ||
+    Math.abs(mediaTime - autoScrollClock.lastSourceTime) > AUTO_SCROLL_CLOCK_RESET_THRESHOLD_SECONDS
+  ) {
+    autoScrollClock = {
+      sourceId,
+      playbackRate,
+      anchorTime: mediaTime,
+      anchorPerformanceTime: now,
+      lastSourceTime: mediaTime,
+      lastVisualTime: mediaTime
+    };
+  }
+
+  const elapsed = ((now - autoScrollClock.anchorPerformanceTime) / 1000) * playbackRate;
+  const estimatedTime = autoScrollClock.anchorTime + elapsed;
+  const boundedLeadTime = Math.min(estimatedTime, mediaTime + AUTO_SCROLL_MAX_LEAD_SECONDS);
+  let visualTime = Math.max(autoScrollClock.lastVisualTime, boundedLeadTime);
+
+  if (totalDuration > 0) {
+    visualTime = Math.min(visualTime, totalDuration);
+  }
+
+  autoScrollClock.lastSourceTime = mediaTime;
+  autoScrollClock.lastVisualTime = visualTime;
+
+  return visualTime;
+}
+
+/**
+ * @returns {void}
+ */
 function updateScroll() {
   if (animationFrameId) {
     cancelAnimationFrame(animationFrameId); // Prevent duplicates if called rapidly
@@ -741,12 +798,27 @@ function updateScroll() {
   // Use playhead for all timing
   if ((sampleRate && audioPlayer.duration > 0 && currentGuitarTab) || midiOnlyMode) {
     // Get times from unified playhead
-    let currentTime = playheadState.currentTime;
+    const sourceTime = playheadState.currentTime;
+    let currentTime = sourceTime;
     let totalDuration = playheadState.totalDuration;
 
     // Fall back to calculated duration if needed
     if (totalDuration <= 0 && currentGuitarTab) {
       totalDuration = currentGuitarTab[0].length * HOP_SIZE / sampleRate;
+    }
+
+    // Check if we should auto-scroll
+    const shouldAutoScroll = !audioPlayer.paused || midiOnlyMode;
+
+    if (shouldAutoScroll) {
+      currentTime = getAutoScrollClockTime(
+        sourceTime,
+        totalDuration,
+        midiOnlyMode ? playbackRate : audioPlayer.playbackRate,
+        midiOnlyMode ? 'midi' : 'audio'
+      );
+    } else {
+      resetAutoScrollClock();
     }
 
     // Calculate the exact column index for the current time (including fraction)
@@ -759,9 +831,6 @@ function updateScroll() {
     const desiredScrollLeft = calculateScrollPosition(exactColumnIndex);
 
     // Update scroll position during playback
-    // Check if we should auto-scroll
-    const shouldAutoScroll = !audioPlayer.paused || midiOnlyMode;
-
     if (shouldAutoScroll) {
       // Temporarily disable smooth scrolling for immediate updates
       const oldScrollBehavior = tabContainer.style.scrollBehavior;
@@ -813,6 +882,9 @@ function updateScroll() {
  */
 function updateActiveColumn(newColumnIndex) {
   if (newColumnIndex < 0) return; // Don't process negative indexes
+  if (newColumnIndex === lastAnimatedColumnIndex) return;
+
+  lastAnimatedColumnIndex = newColumnIndex;
 
   // Handle virtual scrolling mode
   if (virtualScroller) {
@@ -917,6 +989,7 @@ async function startStandaloneMidiPlayback(startPos) {
  */
 async function startMidiPlayback() {
   if (midiPlayer || !currentGuitarTab) return;
+  resetAutoScrollClock();
   if (!audioPlayer.paused) await startSyncedMidiPlayback();
   else await startStandaloneMidiPlayback(playheadState.currentTime);
 }
@@ -938,6 +1011,7 @@ function stopMidiPlayback() {
     delete audioPlayer.dataset.originalVolume;
   }
   playheadState.updatingFromMidi = false;
+  resetAutoScrollClock();
 }
 
 /**
@@ -972,6 +1046,7 @@ audioInput.addEventListener('change', async (e) => {
     // Reset audio playback
     audioPlayer.pause();
     audioPlayer.currentTime = 0;
+    resetAutoScrollClock();
     
     // Show loading state
     tabDisplay.innerHTML = '<pre>Loading...</pre>';
@@ -1078,6 +1153,7 @@ sensitivitySlider.addEventListener('input', () => {
 zoomSlider.addEventListener('input', () => {
   displayWindowSeconds = parseFloat(zoomSlider.value);
   zoomValue.textContent = `${displayWindowSeconds.toFixed(1)} seconds`;
+  resetAutoScrollClock();
 
   // Only proceed if columnWidth could be calculated initially
   if (columnWidth > 0 && currentGuitarTab) { // Check if tab exists too
@@ -1113,6 +1189,7 @@ tempoSlider.addEventListener('input', () => {
   // Apply new playback rate to audio
   if (audioPlayer.src) {
     audioPlayer.playbackRate = playbackRate;
+    resetAutoScrollClock();
   }
 
   // If standalone MIDI is playing, we need to stop and restart it with the new tempo
@@ -1133,6 +1210,7 @@ audioPlayer.addEventListener('play', () => {
   } else {
     playheadState.updatingFromMidi = false;
     playheadState.updateFromAudio(audioPlayer);
+    resetAutoScrollClock();
   }
 });
 
@@ -1146,6 +1224,7 @@ audioPlayer.addEventListener('pause', () => {
   if (!playheadState.updatingFromMidi) {
     playheadState.updateFromAudio(audioPlayer);
   }
+  resetAutoScrollClock();
 });
 
 audioPlayer.addEventListener('seeking', () => {
@@ -1160,6 +1239,7 @@ audioPlayer.addEventListener('seeking', () => {
     const desiredScrollLeft = calculateScrollPosition(exactColumnIndex);
 
     // Force scroll position update
+    resetAutoScrollClock();
     tabContainer.scrollLeft = Math.round(desiredScrollLeft);
 
     // Force smooth playhead position update
