@@ -6,6 +6,9 @@ const MIN_COLUMN_WIDTH_CALC = 6;
 const MIN_COLUMN_WIDTH_RENDERED = 6.5;
 const AUTO_SCROLL_CLOCK_RESET_THRESHOLD_SECONDS = 0.35;
 const AUTO_SCROLL_MAX_LEAD_SECONDS = 0.08;
+const AUTO_SCROLL_MAX_FRAME_DELTA_SECONDS = 0.05;
+const AUTO_SCROLL_PLL_GAIN = 4;
+const AUTO_SCROLL_MAX_CORRECTION_RATE = 0.18;
 
 let sampleRate = 44100;
 let displayWindowSeconds = DEFAULT_DISPLAY_WINDOW_SECONDS;
@@ -737,6 +740,16 @@ function resetAutoScrollClock() {
 }
 
 /**
+ * @param {number} value
+ * @param {number} min
+ * @param {number} max
+ * @returns {number}
+ */
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(value, max));
+}
+
+/**
  * @param {number} sourceTime
  * @param {number} totalDuration
  * @param {number} rate
@@ -752,29 +765,46 @@ function getAutoScrollClockTime(sourceTime, totalDuration, rate, sourceId) {
     !autoScrollClock ||
     autoScrollClock.sourceId !== sourceId ||
     autoScrollClock.playbackRate !== playbackRate ||
-    Math.abs(mediaTime - autoScrollClock.lastSourceTime) > AUTO_SCROLL_CLOCK_RESET_THRESHOLD_SECONDS
+    Math.abs(mediaTime - autoScrollClock.visualTime) > AUTO_SCROLL_CLOCK_RESET_THRESHOLD_SECONDS
   ) {
     autoScrollClock = {
       sourceId,
       playbackRate,
-      anchorTime: mediaTime,
-      anchorPerformanceTime: now,
-      lastSourceTime: mediaTime,
-      lastVisualTime: mediaTime
+      visualTime: mediaTime,
+      lastPerformanceTime: now
     };
+
+    return mediaTime;
   }
 
-  const elapsed = ((now - autoScrollClock.anchorPerformanceTime) / 1000) * playbackRate;
-  const estimatedTime = autoScrollClock.anchorTime + elapsed;
-  const boundedLeadTime = Math.min(estimatedTime, mediaTime + AUTO_SCROLL_MAX_LEAD_SECONDS);
-  let visualTime = Math.max(autoScrollClock.lastVisualTime, boundedLeadTime);
+  const frameSeconds = clamp(
+    (now - autoScrollClock.lastPerformanceTime) / 1000,
+    0,
+    AUTO_SCROLL_MAX_FRAME_DELTA_SECONDS
+  );
+  const drift = mediaTime - autoScrollClock.visualTime;
+  const correctionRate = clamp(
+    drift * AUTO_SCROLL_PLL_GAIN,
+    -AUTO_SCROLL_MAX_CORRECTION_RATE,
+    AUTO_SCROLL_MAX_CORRECTION_RATE
+  );
+  const visualRate = Math.max(0, playbackRate + correctionRate);
+  const previousVisualTime = autoScrollClock.visualTime;
+  const maxLeadTime = mediaTime + AUTO_SCROLL_MAX_LEAD_SECONDS;
+  let visualTime = previousVisualTime + (frameSeconds * visualRate);
+
+  if (visualTime > maxLeadTime) {
+    visualTime = previousVisualTime > maxLeadTime ? previousVisualTime : maxLeadTime;
+  }
+
+  visualTime = Math.max(previousVisualTime, visualTime);
 
   if (totalDuration > 0) {
     visualTime = Math.min(visualTime, totalDuration);
   }
 
-  autoScrollClock.lastSourceTime = mediaTime;
-  autoScrollClock.lastVisualTime = visualTime;
+  autoScrollClock.visualTime = visualTime;
+  autoScrollClock.lastPerformanceTime = now;
 
   return visualTime;
 }
